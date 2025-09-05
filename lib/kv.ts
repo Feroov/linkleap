@@ -83,5 +83,6 @@ if (HAS_VERCEL_KV) {
   // Local/dev fallback
   kv = memKv;
 }
+export const KV_BACKEND = HAS_VERCEL_KV ? "vercel-kv" : HAS_UPSTASH ? "upstash" : "memory";
 
 export default kv;
