@@ -38,14 +38,11 @@ export async function POST(req: NextRequest) {
     maxPlayers: 2,
   };
 
-  // save this lobby (1h TTL)
-  await kv.set(`lobby:${code}`, meta, { ex: 60 * 60 });
-
-  // also append to a “directory” list we’ll show on the Join page later
+  await kv.set(`lobby:${code}`, meta, { ex: 120 });
   const list = ((await kv.get("lobbies")) as LobbyMeta[] | null) ?? [];
   list.push(meta);
   while (list.length > 200) list.shift(); // keep list small
-  await kv.set("lobbies", list, { ex: 60 * 60 });
+  await kv.set("lobbies", list, { ex: 120 });
 
   return Response.json(meta);
 }
