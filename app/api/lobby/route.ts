@@ -1,58 +1,34 @@
 import { NextRequest } from "next/server";
 import kv from "@/lib/kv";
-import { makeLobbyCode } from "@/lib/ids";
 import type { LobbyMeta } from "@/lib/types";
-import { z } from "zod";
 
+// keep whatever runtime you already set
 export const runtime = "nodejs";
 
-// POST /api/lobby  -> create a new lobby
-export async function POST(req: NextRequest) {
-  const Body = z.object({ seed: z.string().trim().optional() }).strict();
+// GET /api/lobby?code=ABCDE
+export async function GET(req: NextRequest) {
+  const url = new URL(req.url);
 
-  const json = await req.json().catch(() => ({}));
-  const parsed = Body.safeParse(json);
-  const requestedSeed =
-    parsed.success && parsed.data.seed ? parsed.data.seed : null;
-
-  // generate a unique code (few tries just in case)
-  let code = "";
-  for (let i = 0; i < 5; i++) {
-    const c = makeLobbyCode();
-    const exists = await kv.get(`lobby:${c}`);
-    if (!exists) {
-      code = c;
-      break;
+  // --- DIAGNOSTIC BRANCH ---
+  // Call: /api/lobby?diag=1   (no auth, temporary)
+  if (url.searchParams.get("diag") === "1") {
+    try {
+      await kv.set("diag:ping", "ok", { ex: 20 });
+      const v = await kv.get<string>("diag:ping");
+      return Response.json({ kvWorks: v === "ok", value: v });
+    } catch (e) {
+      return Response.json(
+        { kvWorks: false, error: String(e) },
+        { status: 500 }
+      );
     }
   }
-  if (!code)
-    return new Response("Could not generate lobby code", { status: 500 });
+  // --- END DIAGNOSTIC ---
 
-  const seed =
-    requestedSeed ?? Math.floor(Math.random() * 2 ** 31).toString(36);
-  const meta: LobbyMeta = {
-    code,
-    seed,
-    status: "waiting",
-    createdAt: Date.now(),
-    maxPlayers: 2,
-  };
-
-  await kv.set(`lobby:${code}`, meta, { ex: 120 });
-  const list = ((await kv.get("lobbies")) as LobbyMeta[] | null) ?? [];
-  list.push(meta);
-  while (list.length > 200) list.shift(); // keep list small
-  await kv.set("lobbies", list, { ex: 120 });
-
-  return Response.json(meta);
-}
-
-// GET /api/lobby?code=ABCDE  -> fetch lobby meta (handy for testing)
-export async function GET(req: NextRequest) {
-  const { searchParams } = new URL(req.url);
-  const code = searchParams.get("code");
+  const code = url.searchParams.get("code");
   if (!code) return new Response("Missing code", { status: 400 });
-  const meta = (await kv.get(`lobby:${code}`)) as LobbyMeta | null;
+
+  const meta = (await kv.get<LobbyMeta>(`lobby:${code}`)) as LobbyMeta | null;
   if (!meta) return new Response("Not found", { status: 404 });
   return Response.json(meta);
 }
