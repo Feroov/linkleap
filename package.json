@@ -13,6 +13,7 @@
     "@liveblocks/node": "^3.6.0",
     "@liveblocks/react": "^3.6.0",
     "@supabase/supabase-js": "^2.57.0",
+    "@upstash/redis": "^1.35.3",
     "@vercel/kv": "^3.0.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
@@ -22,6 +23,7 @@
     "next": "15.5.2",
     "react": "19.1.0",
     "react-dom": "19.1.0",
+    "vercel": "^47.0.5",
     "zod": "^4.1.5"
   },
   "devDependencies": {
