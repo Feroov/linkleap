@@ -1,34 +1,41 @@
+// app/api/lobby/route.ts
 import { NextRequest } from "next/server";
 import kv from "@/lib/kv";
+import { makeLobbyCode } from "@/lib/ids";
 import type { LobbyMeta } from "@/lib/types";
 
-// keep whatever runtime you already set
 export const runtime = "nodejs";
 
-// GET /api/lobby?code=ABCDE
-export async function GET(req: NextRequest) {
-  const url = new URL(req.url);
-
-  // --- DIAGNOSTIC BRANCH ---
-  // Call: /api/lobby?diag=1   (no auth, temporary)
-  if (url.searchParams.get("diag") === "1") {
-    try {
-      await kv.set("diag:ping", "ok", { ex: 20 });
-      const v = await kv.get<string>("diag:ping");
-      return Response.json({ kvWorks: v === "ok", value: v });
-    } catch (e) {
-      return Response.json(
-        { kvWorks: false, error: String(e) },
-        { status: 500 }
-      );
-    }
+// POST /api/lobby  -> create lobby
+export async function POST(_req: NextRequest) {
+  // create unique code (retry a few times to avoid rare collisions)
+  let code = "";
+  for (let i = 0; i < 5; i++) {
+    code = makeLobbyCode(5);
+    const exists = await kv.get(`lobby:${code}`);
+    if (!exists) break;
   }
-  // --- END DIAGNOSTIC ---
+  if (!code) return new Response("Failed to allocate code", { status: 500 });
 
-  const code = url.searchParams.get("code");
-  if (!code) return new Response("Missing code", { status: 400 });
+  const meta: LobbyMeta = {
+    code,
+    seed: Math.random().toString(36).slice(2, 10),
+    status: "waiting",
+    createdAt: Date.now(),
+    maxPlayers: 2,
+  };
 
-  const meta = (await kv.get<LobbyMeta>(`lobby:${code}`)) as LobbyMeta | null;
-  if (!meta) return new Response("Not found", { status: 404 });
+  // store the lobby with TTL (2m) and update the directory list
+  await kv.set(`lobby:${code}`, meta, { ex: 120 });
+  const list = ((await kv.get<LobbyMeta[]>("lobbies")) ?? []).filter(
+    // keep only recent waiting lobbies; avoid unbounded growth
+    (l) => l.status === "waiting" && Date.now() - l.createdAt < 60 * 60 * 1000
+  );
+  list.unshift(meta);
+  await kv.set("lobbies", list.slice(0, 200), { ex: 120 });
+
   return Response.json(meta);
 }
+
+// GET /api/lobby?code=ABCDE  (keep your existing GET & diag)
+export async function GET(req: NextRequest) { /* … your existing code … */ }
