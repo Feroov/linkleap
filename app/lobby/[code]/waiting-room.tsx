@@ -10,6 +10,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { Link as LinkIcon, Play } from "lucide-react";
 import { nanoid } from "nanoid/non-secure";
+import { useRouter } from "next/navigation";
 
 type Player = { id: string; name: string; ready: boolean; you?: boolean };
 
@@ -22,6 +23,7 @@ export default function WaitingRoom({
   seed: string;
   isHost: boolean;
 }) {
+  const r = useRouter();
   const { push } = useToast();
   const [name, setName] = useState<string>("Player");
   const [ready, setReady] = useState(false);
@@ -83,6 +85,51 @@ export default function WaitingRoom({
     chan.track({ name, ready }).catch(() => {});
   }, [name, ready]);
 
+  // Navigate to the game when a START broadcast arrives
+  // Join presence
+  useEffect(() => {
+    myIdRef.current = nanoid(16);
+    const chan = supabase.channel(`lobby:${code}`, {
+      config: { presence: { key: myIdRef.current } },
+    });
+    channelRef.current = chan;
+
+    // PRESENCE
+    chan.on("presence", { event: "sync" }, () => {
+      const state = chan.presenceState() as Record<
+        string,
+        Array<{ name: string; ready: boolean }>
+      >;
+      const list: Player[] = [];
+      for (const [id, arr] of Object.entries(state)) {
+        const last = arr[arr.length - 1] || { name: "Player", ready: false };
+        list.push({
+          id,
+          name: last.name,
+          ready: last.ready,
+          you: id === myIdRef.current,
+        });
+      }
+      setPlayers(list.sort((a, b) => (a.you ? -1 : 1)));
+    });
+
+    // ⬇️ START listener here
+    chan.on("broadcast", { event: "START" }, () => {
+      r.push(`/lobby/${code}/game${isHost ? "?host=1" : ""}`);
+    });
+
+    chan.subscribe(async (status) => {
+      if (status === "SUBSCRIBED") {
+        await chan.track({ name, ready: false });
+      }
+    });
+
+    return () => {
+      chan.unsubscribe(); // removes all listeners for this channel
+    };
+    // include r & isHost so the closure stays fresh
+  }, [code, r, isHost]);
+
   useEffect(() => {
     const tick = () => {
       fetch("/api/lobby-keepalive", {
@@ -101,50 +148,57 @@ export default function WaitingRoom({
     [isHost, players]
   );
 
-type NavigatorWithShare = Navigator & {
-  share?: (data: { title?: string; text?: string; url?: string }) => Promise<void>;
-};
+  type NavigatorWithShare = Navigator & {
+    share?: (data: {
+      title?: string;
+      text?: string;
+      url?: string;
+    }) => Promise<void>;
+  };
 
-async function copyInvite() {
-  const url = `${location.origin}/lobby/${code}`;
+  async function copyInvite() {
+    const url = `${location.origin}/lobby/${code}`;
 
-  try {
-    // 1) Preferred (requires HTTPS or localhost)
-    if (typeof navigator !== "undefined" && navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(url);
-      push({ title: "Invite link copied" });
-      return;
+    try {
+      // 1) Preferred (requires HTTPS or localhost)
+      if (
+        typeof navigator !== "undefined" &&
+        navigator.clipboard &&
+        window.isSecureContext
+      ) {
+        await navigator.clipboard.writeText(url);
+        push({ title: "Invite link copied" });
+        return;
+      }
+
+      // 2) Fallback: legacy execCommand copy (works on HTTP and older webviews)
+      const ta = document.createElement("textarea");
+      ta.value = url;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      if (ok) {
+        push({ title: "Invite link copied" });
+        return;
+      }
+
+      // 3) Extra fallback: Web Share API (mobile PWAs etc.)
+      const nav = navigator as NavigatorWithShare;
+      if (nav.share) {
+        await nav.share({ title: "LinkLeap lobby", url });
+        return;
+      }
+
+      // 4) Last resort: show the URL to copy manually
+      push({ title: `Copy this: ${url}`, kind: "err" });
+    } catch {
+      push({ title: `Copy this: ${url}`, kind: "err" });
     }
-
-    // 2) Fallback: legacy execCommand copy (works on HTTP and older webviews)
-    const ta = document.createElement("textarea");
-    ta.value = url;
-    ta.setAttribute("readonly", "");
-    ta.style.position = "fixed";
-    ta.style.left = "-9999px";
-    document.body.appendChild(ta);
-    ta.select();
-    const ok = document.execCommand("copy");
-    document.body.removeChild(ta);
-    if (ok) {
-      push({ title: "Invite link copied" });
-      return;
-    }
-
-    // 3) Extra fallback: Web Share API (mobile PWAs etc.)
-    const nav = navigator as NavigatorWithShare;
-    if (nav.share) {
-      await nav.share({ title: "LinkLeap lobby", url });
-      return;
-    }
-
-    // 4) Last resort: show the URL to copy manually
-    push({ title: `Copy this: ${url}`, kind: "err" });
-  } catch {
-    push({ title: `Copy this: ${url}`, kind: "err" });
   }
-}
-
 
   return (
     <main className="pt-8">
@@ -179,12 +233,20 @@ async function copyInvite() {
           disabled={!canStart}
           className="gap-2"
           look="accent"
-          onClick={() =>
-            push({ title: "Game start (stub) — next: game scene" })
-          }
+          onClick={async () => {
+            // Host announces start to everyone…
+            await channelRef.current?.send({
+              type: "broadcast",
+              event: "START",
+              payload: {},
+            });
+            // …and navigates immediately
+            r.push(`/lobby/${code}/game?host=1`);
+          }}
         >
           <Play className="h-4 w-4" /> Start game
         </Button>
+
         <Link href="/" className="ml-auto text-white/70 hover:text-white">
           ← Main menu
         </Link>
