@@ -1,88 +1,70 @@
-import { kv as vercelKv } from "@vercel/kv";
-import { Redis as UpstashRedis } from "@upstash/redis";
+// lib/kv.ts
+import "server-only";
+import { createClient } from "redis";
 
-// Minimal KV interface we use everywhere
+// Minimal surface we actually use (so we don't pull Redis' heavy types)
+type RedisBasic = {
+  get(key: string): Promise<string | null>;
+  set(
+    key: string,
+    value: string,
+    opts?: { EX?: number }
+  ): Promise<unknown>;
+  del(key: string): Promise<unknown>;
+  on(event: "error", listener: (err: unknown) => void): void;
+  connect(): Promise<void>;
+};
+
 type KV = {
   get<T = unknown>(key: string): Promise<T | null>;
   set(key: string, value: unknown, opts?: { ex?: number }): Promise<void>;
   del?(key: string): Promise<number | void>;
 };
 
-// Which envs do we have?
-const HAS_VERCEL_KV =
-  Boolean(process.env.KV_REST_API_URL) && Boolean(process.env.KV_REST_API_TOKEN);
-const HAS_UPSTASH =
-  Boolean(process.env.UPSTASH_REDIS_REST_URL) &&
-  Boolean(process.env.UPSTASH_REDIS_REST_TOKEN);
+// Cache one client per runtime
+let _client: RedisBasic | null = null;
 
-// ---------- In-memory fallback for local dev (with TTL) ----------
-type Entry = { value: unknown; expiresAt?: number };
-const g = globalThis as unknown as { __MEMKV?: Map<string, Entry> };
-g.__MEMKV ??= new Map<string, Entry>();
-const mem = g.__MEMKV;
+async function getClient(): Promise<RedisBasic> {
+  if (_client) return _client;
 
-const memKv: KV = {
+  const url = process.env.REDIS_URL;
+  if (!url) throw new Error("Missing REDIS_URL env");
+
+  const client = createClient({
+    url,
+    socket: { connectTimeout: 5000 },
+  }) as unknown as RedisBasic;
+
+  client.on("error", (err) => console.error("Redis error", err));
+  await client.connect();
+  _client = client;
+  return _client;
+}
+
+const kv: KV = {
   async get<T = unknown>(key: string): Promise<T | null> {
-    const e = mem.get(key);
-    if (!e) return null;
-    if (e.expiresAt && Date.now() > e.expiresAt) {
-      mem.delete(key);
-      return null;
+    const client = await getClient();
+    const raw = await client.get(key);
+    if (raw == null) return null;
+    try {
+      return JSON.parse(raw) as T;
+    } catch {
+      return raw as unknown as T;
     }
-    return e.value as T;
   },
+
   async set(key: string, value: unknown, opts?: { ex?: number }) {
-    const entry: Entry = { value };
-    if (opts?.ex) entry.expiresAt = Date.now() + opts.ex * 1000;
-    mem.set(key, entry);
+    const client = await getClient();
+    const payload = JSON.stringify(value);
+    if (opts?.ex) await client.set(key, payload, { EX: opts.ex });
+    else await client.set(key, payload);
   },
+
   async del(key: string) {
-    mem.delete(key);
+    const client = await getClient();
+    await client.del(key);
   },
 };
 
-// ---------- Choose the real backend if available ----------
-let kv: KV;
-
-if (HAS_VERCEL_KV) {
-  // Vercel KV (will read KV_REST_API_URL/TOKEN)
-  kv = vercelKv as unknown as KV;
-} else if (HAS_UPSTASH) {
-  // Upstash Redis via REST (uses UPSTASH_REDIS_REST_URL/TOKEN)
-  const redis = new UpstashRedis({
-    url: process.env.UPSTASH_REDIS_REST_URL!,
-    token: process.env.UPSTASH_REDIS_REST_TOKEN!,
-  });
-
-  kv = {
-    async get<T = unknown>(key: string): Promise<T | null> {
-      // We store JSON strings, so read string and JSON.parse
-      const raw = await redis.get<string>(key);
-      if (typeof raw !== "string") return null;
-      try {
-        return JSON.parse(raw) as T;
-      } catch {
-        return null;
-      }
-    },
-
-    async set(key: string, value: unknown, opts?: { ex?: number }): Promise<void> {
-      const payload = JSON.stringify(value);
-      if (opts?.ex) {
-        await redis.set(key, payload, { ex: opts.ex }); // seconds
-      } else {
-        await redis.set(key, payload);
-      }
-    },
-
-    async del(key: string): Promise<void> {
-      await redis.del(key);
-    },
-  };
-} else {
-  // Local/dev fallback
-  kv = memKv;
-}
-export const KV_BACKEND = HAS_VERCEL_KV ? "vercel-kv" : HAS_UPSTASH ? "upstash" : "memory";
-
+export const KV_BACKEND = "redis-url";
 export default kv;
