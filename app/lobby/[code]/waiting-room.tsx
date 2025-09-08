@@ -25,13 +25,98 @@ export default function WaitingRoom({
 }) {
   const r = useRouter();
   const { push } = useToast();
+
   const [name, setName] = useState<string>("Player");
   const [ready, setReady] = useState(false);
   const [players, setPlayers] = useState<Player[]>([]);
-  const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
-  const myIdRef = useRef<string>("");
+  const debounceIdRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // read saved name after mount
+
+  const nameRef = useRef(name);
+  const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  const myIdRef = useRef<string>(nanoid(16)); // stable for the whole session
+
+  useEffect(() => {
+    nameRef.current = name;
+  }, [name]);
+
+  // Immediately reflect my typed name in the list without waiting for presence roundtrip
+  useEffect(() => {
+    setPlayers((prev) =>
+      prev.map((p) => (p.id === myIdRef.current ? { ...p, name } : p))
+    );
+  }, [name]);
+
+  // single channel: presence + START
+  useEffect(() => {
+    const chan = supabase.channel(`lobby:${code}`, {
+      config: {
+        presence: { key: myIdRef.current },
+        broadcast: { self: false },
+      },
+    });
+    channelRef.current = chan;
+
+    // stable roster (collapse multi-connections; cap at two)
+    chan.on("presence", { event: "sync" }, () => {
+      const state = chan.presenceState() as Record<
+        string,
+        Array<{ name: string; ready: boolean }>
+      >;
+
+      setPlayers((prev) => {
+        // Build fresh list from presence state (no mutation of prev)
+        const built: Player[] = Object.entries(state).map(([id, arr]) => {
+          const last = arr[arr.length - 1] || { name: "Player", ready: false };
+          return {
+            id,
+            name: id === myIdRef.current ? nameRef.current : last.name,
+            ready: last.ready,
+            you: id === myIdRef.current,
+          };
+        });
+
+        const next = built
+          .sort((a, b) => (a.you ? -1 : b.you ? 1 : a.id.localeCompare(b.id)))
+          .slice(0, 2);
+
+        // Preserve object identity when nothing changed to avoid re-animating rows
+        const prevById = new Map(prev.map((p) => [p.id, p]));
+        const merged = next.map((n) => {
+          const p = prevById.get(n.id);
+          return p &&
+            p.name === n.name &&
+            p.ready === n.ready &&
+            !!p.you === !!n.you
+            ? p
+            : n; // return new object only if something actually changed
+        });
+
+        return merged;
+      });
+    });
+
+    // navigate when someone broadcasts START (use the latest name from ref)
+    chan.on("broadcast", { event: "START" }, () => {
+      const qs = `?n=${encodeURIComponent(nameRef.current)}`;
+      // guest uses ?n= only; host uses the button below (pushes ?host=1&n=…)
+      r.push(`/lobby/${code}/game${qs}`);
+    });
+
+    chan.subscribe(async (status) => {
+      if (status === "SUBSCRIBED") {
+        await chan.track({ name: nameRef.current, ready: false });
+      }
+    });
+
+    return () => {
+      chan.unsubscribe();
+      channelRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [code]); // <-- ONLY depends on code
+
+  // load/save name
   useEffect(() => {
     const saved =
       typeof window !== "undefined" ? localStorage.getItem("ll_name") : null;
@@ -41,95 +126,22 @@ export default function WaitingRoom({
     if (typeof window !== "undefined") localStorage.setItem("ll_name", name);
   }, [name]);
 
-  // Join presence
-  useEffect(() => {
-    myIdRef.current = nanoid(16);
-    const chan = supabase.channel(`lobby:${code}`, {
-      config: { presence: { key: myIdRef.current } },
-    });
-    channelRef.current = chan;
-
-    chan.on("presence", { event: "sync" }, () => {
-      const state = chan.presenceState() as Record<
-        string,
-        Array<{ name: string; ready: boolean }>
-      >;
-      const list: Player[] = [];
-      for (const [id, arr] of Object.entries(state)) {
-        const last = arr[arr.length - 1] || { name: "Player", ready: false };
-        list.push({
-          id,
-          name: last.name,
-          ready: last.ready,
-          you: id === myIdRef.current,
-        });
-      }
-      setPlayers(list.sort((a, b) => (a.you ? -1 : 1)));
-    });
-
-    chan.subscribe(async (status) => {
-      if (status === "SUBSCRIBED") {
-        await chan.track({ name, ready: false });
-      }
-    });
-
-    return () => {
-      chan.unsubscribe();
-    };
-  }, [code]);
-
-  // Update presence when name/ready changes
+  // debounced presence updates so typing name doesn't jitter the list
   useEffect(() => {
     const chan = channelRef.current;
     if (!chan) return;
-    chan.track({ name, ready }).catch(() => {});
-  }, [name, ready]);
 
-  // Navigate to the game when a START broadcast arrives
-  // Join presence
-  useEffect(() => {
-    myIdRef.current = nanoid(16);
-    const chan = supabase.channel(`lobby:${code}`, {
-      config: { presence: { key: myIdRef.current } },
-    });
-    channelRef.current = chan;
-
-    // PRESENCE
-    chan.on("presence", { event: "sync" }, () => {
-      const state = chan.presenceState() as Record<
-        string,
-        Array<{ name: string; ready: boolean }>
-      >;
-      const list: Player[] = [];
-      for (const [id, arr] of Object.entries(state)) {
-        const last = arr[arr.length - 1] || { name: "Player", ready: false };
-        list.push({
-          id,
-          name: last.name,
-          ready: last.ready,
-          you: id === myIdRef.current,
-        });
-      }
-      setPlayers(list.sort((a, b) => (a.you ? -1 : 1)));
-    });
-
-    // ⬇️ START listener here
-    chan.on("broadcast", { event: "START" }, () => {
-      r.push(`/lobby/${code}/game${isHost ? "?host=1" : ""}`);
-    });
-
-    chan.subscribe(async (status) => {
-      if (status === "SUBSCRIBED") {
-        await chan.track({ name, ready: false });
-      }
-    });
+    if (debounceIdRef.current) clearTimeout(debounceIdRef.current);
+    debounceIdRef.current = setTimeout(() => {
+      chan.track({ name, ready }).catch(() => {});
+    }, 250);
 
     return () => {
-      chan.unsubscribe(); // removes all listeners for this channel
+      if (debounceIdRef.current) clearTimeout(debounceIdRef.current);
     };
-    // include r & isHost so the closure stays fresh
-  }, [code, r, isHost]);
+  }, [name, ready]);
 
+  // keep lobby alive (optional)
   useEffect(() => {
     const tick = () => {
       fetch("/api/lobby-keepalive", {
@@ -158,9 +170,7 @@ export default function WaitingRoom({
 
   async function copyInvite() {
     const url = `${location.origin}/lobby/${code}`;
-
     try {
-      // 1) Preferred (requires HTTPS or localhost)
       if (
         typeof navigator !== "undefined" &&
         navigator.clipboard &&
@@ -170,8 +180,6 @@ export default function WaitingRoom({
         push({ title: "Invite link copied" });
         return;
       }
-
-      // 2) Fallback: legacy execCommand copy (works on HTTP and older webviews)
       const ta = document.createElement("textarea");
       ta.value = url;
       ta.setAttribute("readonly", "");
@@ -186,14 +194,12 @@ export default function WaitingRoom({
         return;
       }
 
-      // 3) Extra fallback: Web Share API (mobile PWAs etc.)
       const nav = navigator as NavigatorWithShare;
       if (nav.share) {
         await nav.share({ title: "LinkLeap lobby", url });
         return;
       }
 
-      // 4) Last resort: show the URL to copy manually
       push({ title: `Copy this: ${url}`, kind: "err" });
     } catch {
       push({ title: `Copy this: ${url}`, kind: "err" });
@@ -220,28 +226,29 @@ export default function WaitingRoom({
             className="w-44"
           />
         </div>
+
         <Button
           onClick={() => setReady((v) => !v)}
           look={ready ? "accent" : "solid"}
         >
           {ready ? "Ready ✓" : "Ready up"}
         </Button>
+
         <Button onClick={copyInvite} look="ghost" className="gap-2">
           <LinkIcon className="h-4 w-4" /> Copy invite
         </Button>
+
         <Button
           disabled={!canStart}
           className="gap-2"
           look="accent"
           onClick={async () => {
-            // Host announces start to everyone…
             await channelRef.current?.send({
               type: "broadcast",
               event: "START",
               payload: {},
             });
-            // …and navigates immediately
-            r.push(`/lobby/${code}/game?host=1`);
+            r.push(`/lobby/${code}/game?host=1&n=${encodeURIComponent(name)}`);
           }}
         >
           <Play className="h-4 w-4" /> Start game
@@ -258,7 +265,8 @@ export default function WaitingRoom({
             key={p.id}
             initial={{ opacity: 0, y: 6 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: i * 0.05 }}
+            transition={{ duration: 0.18 }}
+            layout={false}
           >
             <Card
               className={
@@ -268,7 +276,6 @@ export default function WaitingRoom({
                   : "")
               }
             >
-              {/* Avatar */}
               <div
                 className={
                   "relative h-10 w-10 rounded-full " +
@@ -298,7 +305,6 @@ export default function WaitingRoom({
         ))}
       </div>
 
-      {/* Placeholder game art strip */}
       <div className="mt-8 grid grid-cols-3 gap-3">
         <div className="h-20 rounded-xl2 border border-[#23283a] bg-[linear-gradient(135deg,#1a1f30,#1b2037)] shadow-glow" />
         <div className="h-20 rounded-xl2 border border-[#23283a] bg-[linear-gradient(135deg,#1a1f30,#1b2037)] shadow-glow" />
