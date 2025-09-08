@@ -1,71 +1,108 @@
 "use client";
 export const dynamic = "force-dynamic";
 
-import {
-  use as useUnwrap,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
-import { supabase } from "@/lib/supabase";
+import { use as useUnwrap, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { supabase } from "@/lib/supabase";
 
-/* ========= Types ========= */
+type Role = "host" | "guest";
+type Color = "blue" | "orange";
+type Input = { left: boolean; right: boolean; jump: boolean };
+type Tile = { x: number; y: number; w: number; h: number };
+type Level = {
+  platforms: Tile[];
+  spawn: Tile;
+  goal: Tile;
+  size: { w: number; h: number };
+};
+
 type Player = {
   id: "p1" | "p2";
+  color: Color;
+  name: string;
   x: number;
   y: number;
   vx: number;
   vy: number;
   onGround: boolean;
-  color: "blue" | "orange";
-  lives: number;
+  hp: number;
   invulnMs: number;
-  name?: string;
 };
-type InputState = { left: boolean; right: boolean; jump: boolean; seq: number };
-type NetInput = InputState & { from: "guest" | "host" };
-type Tile = { x: number; y: number; w: number; h: number };
-type Switch = {
-  platform: Tile;
-  padTop: Tile;
-  color: "blue" | "orange";
-  pressed: boolean;
-};
-type Gate = { rect: Tile; color: "blue" | "orange"; open: boolean };
-type Enemy = {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  dir: 1 | -1;
-  left: number;
-  right: number;
-  speed: number;
-};
-type Particle = { x: number; y: number; vx: number; vy: number; life: number };
 
-type Snapshot = {
+type StatePacket = {
   t: number;
   p1: Player;
   p2: Player;
-  gates: { open: boolean }[];
-  switches: { pressed: boolean }[];
-  enemies: Enemy[];
-  particles: Particle[];
-  gameOver?: boolean;
+  win: boolean;
 };
 
-type Pose = {
+type InputPacket = {
+  from: Role;
+  color: Color;
+  input: Input;
+  seq: number;
+};
+
+type ChatPacket = {
   t: number;
-  p: Pick<Player, "x" | "y" | "vx" | "vy" | "onGround" | "name"> & {
-    id: "p1" | "p2";
-  };
+  from: { name: string; color: Color };
+  text: string;
 };
 
-/* ========= Utils ========= */
+type PongPacket = {
+  pingClientAt: number;
+  pongHostAt: number;
+};
+
+const VIEW_W = 960;
+const VIEW_H = 540;
+const HALF_W = 12;
+const HALF_H = 16;
+
+const MOVE = 0.45;
+const MAX_VX = 2.6;
+const JUMP_VY = -7.5;
+const GRAV = 0.6;
+const FRICTION = 0.82;
+const STEP_MS = 1000 / 60;
+
+const START_HP = 5;
+const INVULN_AFTER_DEATH_MS = 1000;
+const VOID_FALL_BUFFER = 60;
+
+const SPAWN_COLOR = "#60a5fa";
+const GOAL_COLOR = "#22c55e";
+const PLATFORM_COLOR = "#1f2937";
+
+const GUEST_KEEPALIVE_MS = 100;
+const HOST_INPUT_STALE_MS = 400;
+
+const EXTRAPOLATE_CAP_MS = 50;
+const PING_INTERVAL_MS = 800;
+
+const CAM_MARGIN_L = 260;
+const CAM_MARGIN_R = 320;
+
+function clamp(v: number, a: number, b: number) {
+  return Math.max(a, Math.min(b, v));
+}
+const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+function aabb(a: Tile, b: Tile) {
+  return (
+    a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
+  );
+}
+function feetBox(p: Player): Tile {
+  return { x: p.x - HALF_W, y: p.y + HALF_H - 2, w: HALF_W * 2, h: 6 };
+}
+function hashSeed(s: string) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
 function mulberry32(seed: number) {
   let t = seed >>> 0;
   return function () {
@@ -75,161 +112,38 @@ function mulberry32(seed: number) {
     return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
   };
 }
-function hashSeed(s: string) {
-  let h = 2166136261;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return h >>> 0;
-}
-function aabb(a: Tile, b: Tile) {
-  return (
-    a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
-  );
-}
-function clamp(v: number, a: number, b: number) {
-  return Math.max(a, Math.min(b, v));
-}
-
-/* ========= Physics & View constants ========= */
-const GRAV = 0.7,
-  MOVE = 0.6,
-  MAXVX = 3.2,
-  JUMP = -10,
-  FRICTION = 0.85,
-  STEP_MS = 1000 / 60;
-const STEP_UP = 6;
-const HALF_W = 8,
-  HALF_H = 10;
-
-const VIEW_W = 960;
-const MARGIN_L = 220,
-  MARGIN_R = 260;
-
-/* ========= Procedural level ========= */
-function genLevel(seed: string) {
-  const rnd = mulberry32(hashSeed(seed));
-  const W = 80,
-    H = 18,
-    tile = 24;
-
-  const tiles: Tile[] = [];
-  const lava: Tile[] = [];
-
-  let prevY = 10;
-  for (let x = 2; x < W - 2; x += 3) {
-    let y = 6 + Math.floor(rnd() * 8);
-    const dy = y - prevY;
-    if (dy > 3) y = prevY + 3;
-    if (dy < -3) y = prevY - 3;
-    prevY = y;
-
-    const width = 2 + Math.floor(rnd() * 2);
-    tiles.push({ x: x * tile, y: y * tile, w: width * tile, h: tile });
-    if (dy > 2)
-      tiles.push({
-        x: (x - 1) * tile,
-        y: (y + 1) * tile,
-        w: 1 * tile,
-        h: tile,
-      });
-
-    if (rnd() < 0.35)
-      lava.push({
-        x: x * tile,
-        y: (H - 2) * tile,
-        w: width * tile,
-        h: 2 * tile,
-      });
-  }
-
-  const start = { x: 1 * tile, y: 10 * tile, w: 3 * tile, h: tile };
-  const finish = { x: (W - 6) * tile, y: 9 * tile, w: 3 * tile, h: tile };
-  tiles.push(start, finish);
-
-  for (let i = 0; i < 3; i++) {
-    tiles.push({
-      x: (W - 12 + i * 2) * tile,
-      y: (11 - i) * tile,
-      w: 2 * tile,
-      h: tile,
-    });
-  }
-
-  const pads: Switch[] = [
-    {
-      platform: { x: (W - 16) * tile, y: 11 * tile, w: 2 * tile, h: tile / 2 },
-      padTop: { x: (W - 16) * tile, y: 11 * tile, w: 2 * tile, h: 6 },
-      color: "blue",
-      pressed: false,
-    },
-    {
-      platform: { x: (W - 13) * tile, y: 11 * tile, w: 2 * tile, h: tile / 2 },
-      padTop: { x: (W - 13) * tile, y: 11 * tile, w: 2 * tile, h: 6 },
-      color: "orange",
-      pressed: false,
-    },
-    {
-      platform: { x: (W - 22) * tile, y: 8 * tile, w: 2 * tile, h: tile / 2 },
-      padTop: { x: (W - 22) * tile, y: 8 * tile, w: 2 * tile, h: 6 },
-      color: "blue",
-      pressed: false,
-    },
-    {
-      platform: { x: (W - 19) * tile, y: 8 * tile, w: 2 * tile, h: tile / 2 },
-      padTop: { x: (W - 19) * tile, y: 8 * tile, w: 2 * tile, h: 6 },
-      color: "orange",
-      pressed: false,
-    },
+function genLevel(seedStr: string): Level {
+  const rnd = mulberry32(hashSeed(seedStr || "fallback"));
+  const WORLD_W = 3600;
+  const groundY = 400;
+  const spawn: Tile = { x: 80, y: groundY - 12, w: 120, h: 12 };
+  const platforms: Tile[] = [
+    { x: 0, y: groundY, w: WORLD_W, h: VIEW_H - groundY },
   ];
-  for (const p of pads) tiles.push(p.platform);
-
-  const gates: Gate[] = [
-    {
-      rect: { x: (W - 9) * tile, y: 6 * tile, w: 8, h: 5 * tile },
-      color: "blue",
-      open: false,
-    },
-    {
-      rect: { x: (W - 8) * tile + 10, y: 6 * tile, w: 8, h: 5 * tile },
-      color: "orange",
-      open: false,
-    },
-    {
-      rect: { x: (W - 27) * tile, y: 5 * tile, w: 8, h: 6 * tile },
-      color: "blue",
-      open: false,
-    },
-    {
-      rect: { x: (W - 26) * tile + 10, y: 5 * tile, w: 8, h: 6 * tile },
-      color: "orange",
-      open: false,
-    },
-  ];
-
-  const enemies: Enemy[] = [];
-  for (let i = 0; i < 6; i++) {
-    const baseX = 6 + Math.floor(rnd() * (W - 20));
-    const yTile = 9 + Math.floor(rnd() * 6);
-    enemies.push({
-      x: baseX * tile,
-      y: yTile * tile - 10,
-      w: 16,
-      h: 12,
-      dir: rnd() < 0.5 ? 1 : -1,
-      left: (baseX - 2) * tile,
-      right: (baseX + 4) * tile,
-      speed: 0.8 + rnd() * 0.8,
-    });
+  let x = 220;
+  while (x < WORLD_W - 480) {
+    const span = 160 + Math.floor(rnd() * 180);
+    const pw = 120 + Math.floor(rnd() * 160);
+    const py = 230 + Math.floor(rnd() * 120);
+    platforms.push({ x, y: py, w: pw, h: 12 });
+    if (rnd() < 0.55) {
+      const dy = -40 - Math.floor(rnd() * 50);
+      const py2 = clamp(py + dy, 180, groundY - 40);
+      platforms.push({
+        x: x + 80,
+        y: py2,
+        w: 100 + Math.floor(rnd() * 120),
+        h: 12,
+      });
+    }
+    x += span;
   }
-
-  const size = { pxWidth: W * tile, pxHeight: H * tile };
-  return { tiles, start, finish, size, tile, pads, gates, enemies, lava };
+  const goalX = WORLD_W - 220;
+  const goal: Tile = { x: goalX, y: groundY - 12, w: 160, h: 12 };
+  return { platforms, spawn, goal, size: { w: WORLD_W, h: VIEW_H } };
 }
 
-/* ========= Component ========= */
-export default function GamePage({
+export default function Page({
   params,
 }: {
   params: Promise<{ code: string }>;
@@ -237,1065 +151,763 @@ export default function GamePage({
   const { code } = useUnwrap(params);
   const r = useRouter();
 
-  const [seed, setSeed] = useState<string>("");
-  const [isHost, setIsHost] = useState(false);
-  const pendingNamesRef = useRef<{ blue?: string; orange?: string }>({});
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
+
   const chanRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
 
-  // world
-  const level = useMemo(() => (seed ? genLevel(seed) : null), [seed]);
+  const roleRef = useRef<Role>("guest");
+  const myColorRef = useRef<Color>("orange");
+  const myNameRef = useRef<string>("Player");
 
-  const otherPrevRef = useRef<{ t: number; p: Player } | null>(null);
-  const otherCurrRef = useRef<{ t: number; p: Player } | null>(null);
+  const inputRef = useRef<Input>({ left: false, right: false, jump: false });
+  const inputSeqRef = useRef<number>(0);
+  const keepAliveTimerRef = useRef<number | null>(null);
 
-  // canvas + sim refs
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const reqRef = useRef<number | null>(null);
-
-  // players
-  const meColorRef = useRef<"blue" | "orange">("blue");
   const p1Ref = useRef<Player | null>(null);
   const p2Ref = useRef<Player | null>(null);
 
-  // input
-  const inputRef = useRef<InputState>({
-    left: false,
-    right: false,
-    jump: false,
-    seq: 0,
-  });
-  const lastGuestInputRef = useRef<InputState>({
-    left: false,
-    right: false,
-    jump: false,
-    seq: 0,
-  });
+  const stPrevRef = useRef<(StatePacket & { hostT: number }) | null>(null);
+  const stCurrRef = useRef<(StatePacket & { hostT: number }) | null>(null);
+  const latestStateRef = useRef<StatePacket | null>(null);
 
-  // camera, fx, smoothing targets
+  const lastGuestInputAtRef = useRef<number>(performance.now());
+
+  const hostOffsetRef = useRef<number>(0);
+  const ewmaGapRef = useRef<number>(16);
+  const ewmaJitterRef = useRef<number>(2);
+  const renderDelayRef = useRef<number>(36);
+  const pingIntervalIdRef = useRef<number | null>(null);
+
+  const levelRef = useRef<Level | null>(null);
+  const winRef = useRef<boolean>(false);
+
   const camXRef = useRef<number>(0);
-  const particlesRef = useRef<Particle[]>([]);
-  const targetP1Ref = useRef<Player | null>(null);
-  const targetP2Ref = useRef<Player | null>(null);
+  const [chat, setChat] = useState<ChatPacket[]>([]);
+  const chatInputRef = useRef<HTMLInputElement | null>(null);
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
 
-  // game over
-  const gameOverRef = useRef<boolean>(false);
-
-  const lastLivesRef = useRef<{ p1: number; p2: number }>({ p1: 3, p2: 3 });
-  const enemyPrevRef = useRef<{ t: number; enemies: Enemy[] } | null>(null);
-  const enemyCurrRef = useRef<{ t: number; enemies: Enemy[] } | null>(null);
-  const enemyInterpDelayMs = 100; // ~100ms delay for smooth interp on guest
-  const sentGameOverRef = useRef<boolean>(false);
-  const pingIntervalRef = useRef<number | null>(null);
-
-  const interpDelayMsRef = useRef(60); // adaptive, starts ~60ms
-  const rttMsRef = useRef(60);
-  const lastSnapAtRef = useRef<number>(performance.now());
-  const snapGapMsRef = useRef<number>(50);
-  // my name from query (?n=)
-  const myNameRef = useRef<string>("");
-
-  /* ====== fetch seed + host flag + my name ====== */
   useEffect(() => {
-    fetch(`/api/lobby?code=${code}`)
-      .then((res) => (res.ok ? res.json() : null))
-      .then((meta) => setSeed(meta?.seed || "fallback"))
-      .catch(() => setSeed("fallback"));
-
     const qs =
       typeof window !== "undefined"
-        ? new URLSearchParams(location.search)
+        ? new URLSearchParams(window.location.search)
         : null;
-    setIsHost(qs?.get("host") === "1");
+    const isHost = qs?.get("host") === "1";
+    roleRef.current = isHost ? "host" : "guest";
     myNameRef.current =
-      qs?.get("n") || (qs?.get("host") === "1" ? "Blue" : "Orange");
+      qs?.get("n") || (isHost ? "Blue Player" : "Orange Player");
+    myColorRef.current = isHost ? "blue" : "orange";
+  }, []);
+
+  useEffect(() => {
+    levelRef.current = genLevel(code);
   }, [code]);
 
-  /* ====== realtime ====== */
   useEffect(() => {
-    if (!seed) return;
+    const c = canvasRef.current;
+    if (!c) return;
+    c.width = VIEW_W;
+    c.height = VIEW_H;
+    const ctx = c.getContext("2d");
+    if (!ctx) return;
+    ctxRef.current = ctx;
+  }, []);
 
-    const ch = supabase.channel(`lobby:${code}`, {
+  useEffect(() => {
+    const ch = supabase.channel(`plane:${code}`, {
       config: { broadcast: { self: false } },
     });
     chanRef.current = ch;
 
     ch.on(
       "broadcast",
-      { event: "PING" },
-      ({ payload }: { payload: { t: number } }) => {
-        // host echoes back immediately
-        if (isHost) {
-          ch.send({
-            type: "broadcast",
-            event: "PONG",
-            payload: { t: payload.t },
-          });
-        }
-      }
-    );
-    ch.on(
-      "broadcast",
-      { event: "PONG" },
-      ({ payload }: { payload: { t: number } }) => {
-        if (!isHost) {
-          const now = performance.now();
-          const rtt = now - payload.t;
-          rttMsRef.current = rtt;
-          // target ≈ half RTT + recent pose gap, clamped
-          const target = Math.max(
-            30,
-            Math.min(140, rtt * 0.5 + snapGapMsRef.current)
+      { event: "STATE" },
+      ({ payload }: { payload: StatePacket }) => {
+        if (roleRef.current !== "guest") return;
+        const hostT = payload.t;
+        const pkt = { ...payload, hostT };
+        const prev = stCurrRef.current;
+        if (prev) {
+          const gap = Math.max(1, pkt.hostT - prev.hostT);
+          ewmaGapRef.current = ewmaGapRef.current * 0.9 + gap * 0.1;
+          const diff = gap - ewmaGapRef.current;
+          ewmaJitterRef.current =
+            ewmaJitterRef.current * 0.9 + Math.abs(diff) * 0.1;
+          const targetDelay = clamp(
+            ewmaGapRef.current * 0.5 + ewmaJitterRef.current * 1.5,
+            24,
+            80
           );
-          interpDelayMsRef.current = target;
+          renderDelayRef.current =
+            renderDelayRef.current * 0.85 + targetDelay * 0.15;
         }
+        if (stCurrRef.current) stPrevRef.current = stCurrRef.current;
+        stCurrRef.current = pkt;
+        latestStateRef.current = payload;
       }
     );
 
-    // high-rate pose stream -> smooth "other player"
-    ch.on("broadcast", { event: "POSE" }, ({ payload }: { payload: Pose }) => {
-      if (isHost) return;
-
-      // keep average inter-packet gap for adaptive delay
-      const now = performance.now();
-      const gap = now - lastSnapAtRef.current;
-      snapGapMsRef.current = snapGapMsRef.current * 0.9 + gap * 0.1;
-      lastSnapAtRef.current = now;
-
-      const meIsBlue = meColorRef.current === "blue";
-      const myOtherId = meIsBlue ? "p2" : "p1";
-      if (payload.p.id !== myOtherId) return;
-
-      const poseAsPlayer: Player = {
-        ...(myOtherId === "p1"
-          ? (p1Ref.current as Player)
-          : (p2Ref.current as Player)),
-        x: payload.p.x,
-        y: payload.p.y,
-        vx: payload.p.vx,
-        vy: payload.p.vy,
-        onGround: payload.p.onGround,
-        name: payload.p.name,
-      };
-
-      const tNow = performance.now();
-      if (otherCurrRef.current) {
-        otherPrevRef.current = otherCurrRef.current;
-        otherCurrRef.current = { t: tNow, p: poseAsPlayer };
-      } else {
-        otherPrevRef.current = { t: tNow, p: poseAsPlayer };
-        otherCurrRef.current = { t: tNow, p: poseAsPlayer };
-      }
-    });
-
-    meColorRef.current = isHost ? "blue" : "orange";
-
-    // guest: authoritative snapshots -> targets
-    ch.on(
-      "broadcast",
-      { event: "SNAP" },
-      ({ payload }: { payload: Snapshot }) => {
-        if (isHost) return;
-
-        // store player targets
-        targetP1Ref.current = payload.p1;
-        targetP2Ref.current = payload.p2;
-
-        /* === ADD THIS: advance other-player interpolation buffer on guest === */
-        if (!isHost) {
-          const meIsBlue = meColorRef.current === "blue";
-          const otherFromSnap = meIsBlue ? payload.p2 : payload.p1;
-          const nowT = performance.now();
-
-          // shift the buffer (prev <- curr; curr <- new)
-          if (otherCurrRef.current) {
-            otherPrevRef.current = otherCurrRef.current;
-            otherCurrRef.current = { t: nowT, p: { ...otherFromSnap } };
-          } else {
-            // first packet: seed both so we start from a stable state
-            otherPrevRef.current = { t: nowT, p: { ...otherFromSnap } };
-            otherCurrRef.current = { t: nowT, p: { ...otherFromSnap } };
-          }
-        }
-        /* === END ADD === */
-
-        // --- HARD RECONCILE ON LIFE DROP (snap to host respawn immediately)
-        const lp = lastLivesRef.current;
-        if (payload.p1.lives < lp.p1 && p1Ref.current) {
-          Object.assign(p1Ref.current, payload.p1); // exact host state
-        }
-        if (payload.p2.lives < lp.p2 && p2Ref.current) {
-          Object.assign(p2Ref.current, payload.p2);
-        }
-        lastLivesRef.current = { p1: payload.p1.lives, p2: payload.p2.lives };
-
-        // gates/pads from host
-        if (level) {
-          level.gates.forEach((g, i) => (g.open = !!payload.gates[i]?.open));
-          level.pads.forEach(
-            (s, i) => (s.pressed = !!payload.switches[i]?.pressed)
-          );
-        }
-
-        // ---- Enemy interpolation: shift buffer
-        enemyPrevRef.current = enemyCurrRef.current;
-        enemyCurrRef.current = {
-          t: performance.now(),
-          enemies: payload.enemies.map((e) => ({ ...e })),
-        };
-
-        // particles (you can also skip this on guest to reduce noise)
-        particlesRef.current = payload.particles.map((p) => ({ ...p }));
-
-        if (payload.gameOver) gameOverRef.current = true;
-      }
-    );
-
-    // host receives guest inputs
     ch.on(
       "broadcast",
       { event: "INPUT" },
-      ({ payload }: { payload: NetInput }) => {
-        if (!isHost) return;
-        if (payload.from === "guest") lastGuestInputRef.current = payload;
-      }
-    );
-
-    // share names so tags show
-    ch.on(
-      "broadcast",
-      { event: "MYNAME" },
-      ({
-        payload,
-      }: {
-        payload: { color: "blue" | "orange"; name: string };
-      }) => {
-        const { color, name } = payload;
-        const p = color === "blue" ? p1Ref.current : p2Ref.current;
-        if (p) {
-          p.name = name;
-        } else {
-          pendingNamesRef.current[color] = name; // apply after spawn
+      ({ payload }: { payload: InputPacket }) => {
+        if (roleRef.current !== "host") return;
+        if (payload.color === "orange" && p2Ref.current) {
+          inputGuestRef.current = payload.input;
+          lastGuestInputAtRef.current = performance.now();
         }
       }
     );
 
-    // instant gameover propagation (not just in SNAP)
-    ch.on("broadcast", { event: "GAMEOVER" }, () => {
-      gameOverRef.current = true;
-    });
+    ch.on(
+      "broadcast",
+      { event: "HELLO" },
+      ({
+        payload,
+      }: {
+        payload: { color: Color; name: string; role: Role };
+      }) => {
+        if (roleRef.current !== "host") return;
+        if (payload.color === "blue" && p1Ref.current)
+          p1Ref.current.name = payload.name;
+        if (payload.color === "orange" && p2Ref.current)
+          p2Ref.current.name = payload.name;
+      }
+    );
+
+    ch.on(
+      "broadcast",
+      { event: "PING" },
+      ({ payload }: { payload: { pingClientAt: number } }) => {
+        if (roleRef.current !== "host") return;
+        ch.send({
+          type: "broadcast",
+          event: "PONG",
+          payload: {
+            pingClientAt: payload.pingClientAt,
+            pongHostAt: Date.now(),
+          } as PongPacket,
+        });
+      }
+    );
+
+    ch.on(
+      "broadcast",
+      { event: "PONG" },
+      ({ payload }: { payload: PongPacket }) => {
+        if (roleRef.current !== "guest") return;
+        const now = Date.now();
+        const rtt = now - payload.pingClientAt;
+        const oneWay = rtt * 0.5;
+        const offset = payload.pongHostAt + oneWay - now;
+        hostOffsetRef.current = hostOffsetRef.current * 0.9 + offset * 0.1;
+      }
+    );
+
+    ch.on(
+      "broadcast",
+      { event: "CHAT" },
+      ({ payload }: { payload: ChatPacket }) => {
+        setChat((prev) => [...prev.slice(-49), payload]);
+        queueMicrotask(() => {
+          const box = chatScrollRef.current;
+          if (box) box.scrollTop = box.scrollHeight;
+        });
+      }
+    );
 
     ch.subscribe((status) => {
       if (status === "SUBSCRIBED") {
         ch.send({
           type: "broadcast",
-          event: "MYNAME",
-          payload: { color: meColorRef.current, name: myNameRef.current },
+          event: "HELLO",
+          payload: {
+            color: myColorRef.current,
+            name: myNameRef.current,
+            role: roleRef.current,
+          },
         });
-        if (!isHost) {
-          const ping = () =>
+        if (roleRef.current === "guest") {
+          const id = window.setInterval(() => {
             ch.send({
               type: "broadcast",
               event: "PING",
-              payload: { t: performance.now() },
+              payload: { pingClientAt: Date.now() },
             });
-          ping();
-          const id = window.setInterval(ping, 500); // returns number in the browser
-          pingIntervalRef.current = id;
+          }, PING_INTERVAL_MS);
+          pingIntervalIdRef.current = id;
         }
-        // fire a couple of quick repeats to beat races
-        setTimeout(() => {
-          ch.send({
-            type: "broadcast",
-            event: "MYNAME",
-            payload: { color: meColorRef.current, name: myNameRef.current },
-          });
-        }, 300);
-        setTimeout(() => {
-          ch.send({
-            type: "broadcast",
-            event: "MYNAME",
-            payload: { color: meColorRef.current, name: myNameRef.current },
-          });
-        }, 1000);
       }
     });
 
     return () => {
-      ch.unsubscribe();
-      const id = pingIntervalRef.current;
+      const id = pingIntervalIdRef.current;
       if (id !== null) {
         clearInterval(id);
-        pingIntervalRef.current = null;
+        pingIntervalIdRef.current = null;
       }
+      ch.unsubscribe();
     };
-  }, [code, seed, isHost, level]);
+  }, [code]);
 
-  /* ====== keyboard ====== */
+  const inputGuestRef = useRef<Input>({
+    left: false,
+    right: false,
+    jump: false,
+  });
+
   useEffect(() => {
-    const on = (e: KeyboardEvent, down: boolean) => {
+    const sendGuestInput = () => {
+      if (roleRef.current !== "guest") return;
+      inputSeqRef.current++;
+      chanRef.current?.send({
+        type: "broadcast",
+        event: "INPUT",
+        payload: {
+          from: "guest",
+          color: "orange",
+          input: { ...inputRef.current },
+          seq: inputSeqRef.current,
+        } as InputPacket,
+      });
+    };
+
+    const setKey = (e: KeyboardEvent, down: boolean) => {
+      if (document.activeElement === chatInputRef.current) return;
+      if (e.repeat) return;
+      const i = inputRef.current;
+      let changed = false;
       if (
         ["ArrowLeft", "ArrowRight", " ", "ArrowUp", "w", "a", "d"].includes(
           e.key
         )
       )
         e.preventDefault();
-      const i = inputRef.current;
-      if (e.key === "ArrowLeft" || e.key === "a") i.left = down;
-      if (e.key === "ArrowRight" || e.key === "d") i.right = down;
-      if (e.key === " " || e.key === "ArrowUp" || e.key === "w") i.jump = down;
-      if (down) i.seq++;
+      if (e.key === "ArrowLeft" || e.key === "a") {
+        if (i.left !== down) {
+          i.left = down;
+          changed = true;
+        }
+      }
+      if (e.key === "ArrowRight" || e.key === "d") {
+        if (i.right !== down) {
+          i.right = down;
+          changed = true;
+        }
+      }
+      if (e.key === " " || e.key === "ArrowUp" || e.key === "w") {
+        if (i.jump !== down) {
+          i.jump = down;
+          changed = true;
+        }
+      }
+      if (changed && roleRef.current === "guest") sendGuestInput();
     };
-    const kd = (e: KeyboardEvent) => on(e, true);
-    const ku = (e: KeyboardEvent) => on(e, false);
+
+    const kd = (e: KeyboardEvent) => setKey(e, true);
+    const ku = (e: KeyboardEvent) => setKey(e, false);
+
+    const clearInputsAndNotify = () => {
+      const i = inputRef.current;
+      const wasNonZero = i.left || i.right || i.jump;
+      i.left = i.right = i.jump = false;
+      if (roleRef.current === "guest" && wasNonZero) {
+        inputSeqRef.current++;
+        chanRef.current?.send({
+          type: "broadcast",
+          event: "INPUT",
+          payload: {
+            from: "guest",
+            color: "orange",
+            input: { ...i },
+            seq: inputSeqRef.current,
+          } as InputPacket,
+        });
+      }
+    };
+    const onBlur = () => clearInputsAndNotify();
+    const onVisibility = () => {
+      if (document.visibilityState !== "visible") clearInputsAndNotify();
+    };
+
     window.addEventListener("keydown", kd);
     window.addEventListener("keyup", ku);
+    window.addEventListener("blur", onBlur);
+    document.addEventListener("visibilitychange", onVisibility);
+
+    if (roleRef.current === "guest") {
+      const id = window.setInterval(() => {
+        if (document.visibilityState === "visible") {
+          inputSeqRef.current++;
+          chanRef.current?.send({
+            type: "broadcast",
+            event: "INPUT",
+            payload: {
+              from: "guest",
+              color: "orange",
+              input: { ...inputRef.current },
+              seq: inputSeqRef.current,
+            } as InputPacket,
+          });
+        }
+      }, GUEST_KEEPALIVE_MS);
+      keepAliveTimerRef.current = id;
+    }
+
     return () => {
       window.removeEventListener("keydown", kd);
       window.removeEventListener("keyup", ku);
+      window.removeEventListener("blur", onBlur);
+      document.removeEventListener("visibilitychange", onVisibility);
+      if (keepAliveTimerRef.current !== null) {
+        clearInterval(keepAliveTimerRef.current);
+        keepAliveTimerRef.current = null;
+      }
     };
   }, []);
 
-  /* ====== helpers ====== */
-  const spawnPlayers = useCallback(() => {
-    if (!level) return;
-    p1Ref.current = {
-      id: "p1",
-      x: level.start.x + 18,
-      y: level.start.y - HALF_H,
-      vx: 0,
-      vy: 0,
-      onGround: true,
-      color: "blue",
-      lives: 3,
-      invulnMs: 0,
-      name: meColorRef.current === "blue" ? myNameRef.current : "Blue",
-    };
-    p2Ref.current = {
-      id: "p2",
-      x: level.start.x + 56,
-      y: level.start.y - HALF_H,
-      vx: 0,
-      vy: 0,
-      onGround: true,
-      color: "orange",
-      lives: 3,
-      invulnMs: 0,
-      name: meColorRef.current === "orange" ? myNameRef.current : "Orange",
-    };
-    // initialize smoothing targets so guest has something to lerp to immediately
-    targetP1Ref.current = { ...(p1Ref.current as Player) };
-    targetP2Ref.current = { ...(p2Ref.current as Player) };
-    const pn = pendingNamesRef.current;
-    if (pn.blue && p1Ref.current) p1Ref.current.name = pn.blue;
-    if (pn.orange && p2Ref.current) p2Ref.current.name = pn.orange;
-    // seed guest-side interpolation buffers with the "other" player's current pose
-    if (!isHost) {
-      const otherLocal =
-        meColorRef.current === "blue"
-          ? (p2Ref.current as Player)
-          : (p1Ref.current as Player);
-      const t = performance.now();
-      otherPrevRef.current = { t, p: { ...otherLocal } };
-      otherCurrRef.current = { t, p: { ...otherLocal } };
+  useEffect(() => {
+    const isHost = roleRef.current === "host";
+    if (!ctxRef.current || !levelRef.current) return;
+
+    if (isHost) {
+      const lvl = levelRef.current;
+      const cx = lvl!.spawn.x + lvl!.spawn.w * 0.5;
+      p1Ref.current = {
+        id: "p1",
+        color: "blue",
+        name: myNameRef.current,
+        x: cx - 18,
+        y: lvl!.spawn.y - HALF_H,
+        vx: 0,
+        vy: 0,
+        onGround: true,
+        hp: START_HP,
+        invulnMs: 0,
+      };
+      p2Ref.current = {
+        id: "p2",
+        color: "orange",
+        name: "Guest",
+        x: cx + 18,
+        y: lvl!.spawn.y - HALF_H,
+        vx: 0,
+        vy: 0,
+        onGround: true,
+        hp: START_HP,
+        invulnMs: 0,
+      };
+      camXRef.current = 0;
+      startHostLoop();
+    } else {
+      camXRef.current = 0;
+      startGuestLoop();
     }
-  }, [level]);
 
-  function damage(p: Player, other: Player) {
-    if (p.invulnMs > 0) return;
-    p.lives = Math.max(0, p.lives - 1);
-    p.invulnMs = 1200;
-    if (isHost && (p1Ref.current!.lives <= 0 || p2Ref.current!.lives <= 0))
-      gameOverRef.current = true;
+    return () => {
+      stopLoop();
+    };
+  }, [ctxRef.current, levelRef.current]);
 
-    if (level) {
-      const targetX = other.x;
-      let best: Tile | null = null,
-        bestScore = Infinity;
-      for (const t of level.tiles) {
-        const cx = t.x + t.w / 2,
-          dx = Math.abs(cx - targetX),
-          dy = Math.abs(t.y - other.y);
-        const s = dx + dy * 0.5;
-        if (s < bestScore) {
-          bestScore = s;
-          best = t;
-        }
-      }
-      if (best) {
-        p.x = clamp(best.x + best.w / 2, HALF_W, level.size.pxWidth - HALF_W);
-        p.y = best.y - HALF_H;
-        p.vx = 0;
-        p.vy = 0;
-        for (let i = 0; i < 18; i++)
-          particlesRef.current.push({
-            x: p.x,
-            y: p.y,
-            vx: (Math.random() - 0.5) * 3,
-            vy: -1.5 - Math.random() * 1.5,
-            life: 700 + Math.random() * 400,
-          });
-      }
+  function stopLoop() {
+    if (rafRef.current) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
     }
   }
 
-  const integrate = useCallback(
-    (
-      p: Player,
-      inp: InputState,
-      opts?: { hazards?: boolean; pads?: boolean }
-    ) => {
-      const hazards = opts?.hazards ?? true; // host true, guest false
-      const pads = opts?.pads ?? true; // host true, guest false
-      if (!level) return;
-      if (p.invulnMs > 0) p.invulnMs = Math.max(0, p.invulnMs - STEP_MS);
-
-      // movement
-      if (inp.left) p.vx -= MOVE;
-      if (inp.right) p.vx += MOVE;
-      p.vx = clamp(p.vx, -MAXVX, MAXVX);
-      if (inp.jump && p.onGround) {
-        p.vy = JUMP;
-        p.onGround = false;
-      }
-      p.vy += GRAV;
-
-      let x = p.x + p.vx;
-      let y = p.y + p.vy;
-
-      // colliders: tiles + closed gates + pads' platforms
-      const colliders: Tile[] = [
-        ...level.tiles,
-        ...level.pads.map((s) => s.platform),
-        ...level.gates.filter((g) => !g.open).map((g) => g.rect),
-      ];
-
-      // vertical resolve
-      p.onGround = false;
-      const vbox: Tile = {
-        x: x - HALF_W,
-        y: y - HALF_H,
-        w: HALF_W * 2,
-        h: HALF_H * 2,
-      };
-      for (const t of colliders) {
-        if (!aabb(vbox, t)) continue;
-        if (p.vy > 0 && p.y - HALF_H <= t.y) {
-          y = t.y - HALF_H;
-          p.vy = 0;
-          p.onGround = true;
-        } else if (p.vy < 0 && p.y + HALF_H >= t.y + t.h) {
-          y = t.y + t.h + HALF_H;
-          p.vy = 0;
-        }
-      }
-
-      // horizontal + small step-up
-      let hbox: Tile = {
-        x: x - HALF_W,
-        y: y - HALF_H,
-        w: HALF_W * 2,
-        h: HALF_H * 2,
-      };
-      for (const t of colliders) {
-        if (!aabb(hbox, t)) continue;
-        const movingRight = p.vx > 0;
-        const touchingSide = movingRight
-          ? p.x - HALF_W <= t.x
-          : p.x + HALF_W >= t.x + t.w;
-        if (touchingSide) {
-          let stepped = false;
-          for (let dy = 1; dy <= STEP_UP; dy++) {
-            const test: Tile = {
-              x: x - HALF_W,
-              y: y - HALF_H - dy,
-              w: HALF_W * 2,
-              h: HALF_H * 2,
-            };
-            if (!colliders.some((c) => aabb(test, c))) {
-              y -= dy;
-              x = movingRight ? t.x - HALF_W : t.x + t.w + HALF_W;
-              stepped = true;
-              break;
-            }
-          }
-          if (!stepped) {
-            x = movingRight ? t.x - HALF_W : t.x + t.w + HALF_W;
-            p.vx = 0;
-          }
-          hbox = { x: x - HALF_W, y: y - HALF_H, w: HALF_W * 2, h: HALF_H * 2 };
-        }
-      }
-
-      // bounds
-      p.x = clamp(x, HALF_W, level.size.pxWidth - HALF_W);
-      p.y = y;
-      if (p.onGround) p.vx *= FRICTION;
-
-      // pads: host-only
-      if (pads) {
-        for (const sw of level.pads) {
-          const feet: Tile = {
-            x: p.x - HALF_W,
-            y: p.y + HALF_H - 2,
-            w: HALF_W * 2,
-            h: 4,
-          };
-          if (aabb(feet, sw.padTop) && p.color === sw.color) sw.pressed = true;
-        }
-      }
-
-      // hazards: host-only
-      if (hazards) {
-        // void fall
-        if (p.y > level.size.pxHeight + 50) {
-          const other =
-            p.id === "p1"
-              ? (p2Ref.current as Player)
-              : (p1Ref.current as Player);
-          damage(p, other);
-        }
-        // lava
-        for (const l of level.lava) {
-          const box: Tile = {
-            x: p.x - HALF_W,
-            y: p.y - HALF_H,
-            w: HALF_W * 2,
-            h: HALF_H * 2,
-          };
-          if (aabb(box, l)) {
-            const other =
-              p.id === "p1"
-                ? (p2Ref.current as Player)
-                : (p1Ref.current as Player);
-            damage(p, other);
-            break;
-          }
-        }
-      }
-    },
-    [level]
-  );
-
-  /* ====== main loop ====== */
-  useEffect(() => {
-    if (!level) return;
-
-    const c = canvasRef.current;
-    if (!c) return;
-    c.width = VIEW_W;
-    c.height = level.size.pxHeight;
-
-    // cache 2d ctx once
-    const ctx = c.getContext("2d");
-    if (!ctx) return;
-
-    // reset world
-    spawnPlayers();
-    level.gates.forEach((g) => (g.open = false));
-    level.pads.forEach((s) => (s.pressed = false));
-    camXRef.current = 0;
-    particlesRef.current = [];
-    gameOverRef.current = false;
-
-    // host: send an initial state so guest has names/state immediately
-    // host: send an initial state so guest has names/state immediately
-    if (isHost && chanRef.current) {
-      const firstSnap: Snapshot = {
-        t: Date.now(),
-        p1: p1Ref.current as Player,
-        p2: p2Ref.current as Player,
-        gates: level.gates.map((g) => ({ open: g.open })),
-        switches: level.pads.map((s) => ({ pressed: s.pressed })),
-        enemies: level.enemies.map((e) => ({ ...e })),
-        particles: [],
-        gameOver: false,
-      };
-      chanRef.current.send({
-        type: "broadcast",
-        event: "SNAP",
-        payload: firstSnap,
-      });
-
-      // initialize guest-side interpolation / reconciliation baselines
-      const nowT = performance.now();
-      enemyPrevRef.current = {
-        t: nowT,
-        enemies: level.enemies.map((e) => ({ ...e })),
-      };
-      enemyCurrRef.current = {
-        t: nowT,
-        enemies: level.enemies.map((e) => ({ ...e })),
-      };
-      lastLivesRef.current = {
-        p1: (p1Ref.current as Player).lives,
-        p2: (p2Ref.current as Player).lives,
-      };
-      sentGameOverRef.current = false;
-    }
-
+  function startHostLoop() {
     let acc = 0;
     let last = performance.now();
-    let inputTimer = 0; // for INPUT @ ~60Hz (16ms below)
-    let snapTimer = 0; // for SNAP  @ ~12–20Hz
-    let poseTimer = 0; // for POSE  @ ~60Hz
 
-    const drawFrame = () => {
-      if (!canvasRef.current) return;
-
-      const lvl = level!;
-      ctx.clearRect(0, 0, c.width, c.height);
-      ctx.save();
-      ctx.translate(-Math.floor(camXRef.current), 0);
-
-      // bg
-      ctx.fillStyle = "#0b1125";
-      ctx.fillRect(camXRef.current, 0, c.width, c.height);
-
-      // tiles
-      ctx.fillStyle = "#1d2440";
-      for (const t of lvl.tiles) ctx.fillRect(t.x, t.y, t.w, t.h);
-
-      // lava
-      ctx.fillStyle = "#a6242b";
-      for (const l of lvl.lava) ctx.fillRect(l.x, l.y, l.w, l.h);
-
-      // gates
-      for (const g of lvl.gates) {
-        ctx.fillStyle = g.color === "blue" ? "#6c85ff" : "#ffb23f";
-        ctx.globalAlpha = g.open ? 0.18 : 0.9;
-        ctx.fillRect(g.rect.x, g.rect.y, g.rect.w, g.rect.h);
-        ctx.globalAlpha = 1;
-      }
-
-      // pads
-      for (const s of lvl.pads) {
-        ctx.fillStyle = s.color === "blue" ? "#7c9cff" : "#ff9e57";
-        ctx.globalAlpha = s.pressed ? 1 : 0.65;
-        ctx.fillRect(s.padTop.x, s.padTop.y, s.padTop.w, s.padTop.h);
-        ctx.globalAlpha = 1;
-      }
-
-      // finish
-      ctx.fillStyle = "rgba(73,242,194,.2)";
-      ctx.fillRect(lvl.finish.x, lvl.finish.y, lvl.finish.w, lvl.finish.h);
-
-      // enemies
-      // enemies
-      ctx.fillStyle = "#ffd84d";
-      if (isHost) {
-        // host draws current state
-        for (const e of level.enemies) ctx.fillRect(e.x, e.y, e.w, e.h);
-      } else {
-        // guest draws interpolated between the last two snapshots with a tiny delay
-        const prev = enemyPrevRef.current;
-        const curr = enemyCurrRef.current;
-        const now = performance.now();
-        if (prev && curr) {
-          // render time is slightly behind to avoid extrapolation
-          const renderT = now - enemyInterpDelayMs;
-          const span = Math.max(1, curr.t - prev.t);
-          const t = clamp((renderT - prev.t) / span, 0, 1);
-
-          const a = prev.enemies;
-          const b = curr.enemies;
-          const n = Math.min(a.length, b.length);
-          for (let i = 0; i < n; i++) {
-            const ex = a[i].x + (b[i].x - a[i].x) * t;
-            const ey = a[i].y + (b[i].y - a[i].y) * t;
-            ctx.fillRect(ex, ey, b[i].w, b[i].h);
-          }
-        } else {
-          // fall back to latest if buffer incomplete
-          const src = enemyCurrRef.current?.enemies ?? [];
-          for (const e of src) ctx.fillRect(e.x, e.y, e.w, e.h);
-        }
-      }
-
-      // particles
-      ctx.fillStyle = "#49f2c2";
-      for (const p of particlesRef.current) ctx.fillRect(p.x, p.y, 2, 2);
-
-      // players + name tags
-      const drawP = (p: Player) => {
-        ctx.fillStyle = p.color === "blue" ? "#7c9cff" : "#ff9e57";
-        if (p.invulnMs > 0)
-          ctx.globalAlpha = 0.5 + 0.5 * Math.sin((p.invulnMs / 60) * Math.PI);
-        ctx.fillRect(p.x - HALF_W, p.y - HALF_H, HALF_W * 2, HALF_H * 2);
-        ctx.globalAlpha = 1;
-
-        ctx.font =
-          "12px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto";
-        ctx.textAlign = "center";
-        ctx.fillStyle = "white";
-        ctx.globalAlpha = 0.9;
-        ctx.fillText(
-          p.name || (p.color === "blue" ? "Blue" : "Orange"),
-          p.x,
-          p.y - HALF_H - 6
-        );
-        ctx.globalAlpha = 1;
-      };
-      drawP(p1Ref.current as Player);
-      drawP(p2Ref.current as Player);
-
-      ctx.restore();
-
-      // HUD hearts
-      const heart = (x: number, y: number, n: number, color: string) => {
-        ctx.fillStyle = color;
-        for (let i = 0; i < n; i++) {
-          ctx.beginPath();
-          const px = x + i * 18;
-          ctx.moveTo(px + 6, y + 12);
-          ctx.bezierCurveTo(px - 6, y + 2, px, y - 2, px + 6, y + 4);
-          ctx.bezierCurveTo(px + 12, y - 2, px + 18, y + 2, px + 6, y + 12);
-          ctx.fill();
-        }
-      };
-      heart(12, 10, (p1Ref.current as Player).lives, "#7c9cff");
-      heart(
-        VIEW_W - 12 - 18 * (p2Ref.current as Player).lives,
-        10,
-        (p2Ref.current as Player).lives,
-        "#ff9e57"
-      );
-
-      // Game Over overlay
-      if (gameOverRef.current) {
-        ctx.fillStyle = "rgba(0,0,0,0.6)";
-        ctx.fillRect(0, 0, VIEW_W, c.height);
-        ctx.fillStyle = "#fff";
-        ctx.font = "28px ui-sans-serif, system-ui";
-        ctx.textAlign = "center";
-        ctx.fillText("Game Over", VIEW_W / 2, 120);
-        ctx.font = "16px ui-sans-serif, system-ui";
-        ctx.fillText("A player has run out of hearts.", VIEW_W / 2, 150);
-
-        const btnW = 200,
-          btnH = 40,
-          bx = VIEW_W / 2 - btnW / 2,
-          by = 190;
-        ctx.fillStyle = "#49f2c2";
-        ctx.fillRect(bx, by, btnW, btnH);
-        ctx.fillStyle = "#0b1020";
-        ctx.font = "16px ui-sans-serif, system-ui";
-        ctx.fillText("Back to Main", VIEW_W / 2, by + 26);
-
-        const canvas = canvasRef.current;
-        if (canvas) {
-          canvas.onclick = (ev) => {
-            const rect = canvas.getBoundingClientRect();
-            const x = ev.clientX - rect.left,
-              y = ev.clientY - rect.top;
-            if (x >= bx && x <= bx + btnW && y >= by && y <= by + btnH)
-              r.push("/");
-          };
-        }
-      }
-    };
-
-    const loop = (now: number) => {
-      if (!canvasRef.current) return; // unmounted
-
-      if (gameOverRef.current) {
-        drawFrame();
-        reqRef.current = requestAnimationFrame(loop);
-        return;
-      }
-
+    const step = () => {
+      const now = performance.now();
       const dt = now - last;
-      acc += dt;
-      inputTimer += dt;
-      snapTimer += dt;
-      poseTimer += dt;
-
       last = now;
+      acc += dt;
 
-      // host recomputes pads each step
-      if (isHost) level.pads.forEach((s) => (s.pressed = false));
-
-      // send input ~30Hz
-      if (inputTimer >= 16) {
-        const payload: NetInput = {
-          ...inputRef.current,
-          from: isHost ? "host" : "guest",
-        };
-        chanRef.current?.send({ type: "broadcast", event: "INPUT", payload });
-        inputTimer = 0;
+      while (acc >= STEP_MS) {
+        if (now - lastGuestInputAtRef.current > HOST_INPUT_STALE_MS) {
+          inputGuestRef.current = { left: false, right: false, jump: false };
+        }
+        hostIntegrate();
+        acc -= STEP_MS;
       }
 
-      if (isHost) {
-        // ===== HOST: full simulation =====
-        while (acc >= STEP_MS) {
-          // integrate using correct inputs for each player
-          const p1In =
-            meColorRef.current === "blue"
-              ? inputRef.current
-              : lastGuestInputRef.current;
-          const p2In =
-            meColorRef.current === "orange"
-              ? inputRef.current
-              : lastGuestInputRef.current;
-          integrate(p1Ref.current as Player, p1In);
-          integrate(p2Ref.current as Player, p2In);
+      drawHost();
+      broadcastState();
+      rafRef.current = requestAnimationFrame(step);
+    };
+    rafRef.current = requestAnimationFrame(step);
+  }
 
-          // enemies
-          for (const e of level.enemies) {
-            e.x += e.dir * e.speed;
-            if (e.x < e.left) {
-              e.x = e.left;
-              e.dir = 1;
-            } else if (e.x + e.w > e.right) {
-              e.x = e.right - e.w;
-              e.dir = -1;
-            }
-            const hitBox: Tile = { x: e.x, y: e.y, w: e.w, h: e.h };
-            for (const p of [
-              p1Ref.current as Player,
-              p2Ref.current as Player,
-            ]) {
-              const pb: Tile = {
-                x: p.x - HALF_W,
-                y: p.y - HALF_H,
-                w: HALF_W * 2,
-                h: HALF_H * 2,
-              };
-              if (aabb(hitBox, pb)) {
-                const other =
-                  p.id === "p1"
-                    ? (p2Ref.current as Player)
-                    : (p1Ref.current as Player);
-                damage(p, other);
-              }
-            }
-          }
-          // gates
-          for (const g of level.gates) {
-            const match = level.pads.find((p) => p.color === g.color);
-            g.open = !!match?.pressed;
-          }
+  function startGuestLoop() {
+    const step = () => {
+      drawGuest();
+      rafRef.current = requestAnimationFrame(step);
+    };
+    rafRef.current = requestAnimationFrame(step);
+  }
 
-          if (p1Ref.current!.lives <= 0 || p2Ref.current!.lives <= 0) {
-            gameOverRef.current = true;
-            if (!sentGameOverRef.current) {
-              sentGameOverRef.current = true;
-              chanRef.current?.send({
-                type: "broadcast",
-                event: "GAMEOVER",
-                payload: {},
-              });
-            }
-          }
+  function applyInput(p: Player, i: Input) {
+    if (i.left) p.vx -= MOVE;
+    if (i.right) p.vx += MOVE;
+    if (i.jump && p.onGround) {
+      p.vy = JUMP_VY;
+      p.onGround = false;
+    }
+  }
 
-          // particles
-          particlesRef.current = particlesRef.current
-            .map((pt) => ({
-              ...pt,
-              x: pt.x + pt.vx,
-              y: pt.y + pt.vy,
-              vy: pt.vy + 0.04,
-              life: pt.life - STEP_MS,
-            }))
-            .filter((pt) => pt.life > 0);
+  function resolveCollisions(p: Player) {
+    const lvl = levelRef.current!;
+    const x = p.x;
+    const y = p.y;
+    let vx = p.vx;
+    let vy = p.vy;
+    let nextY = y + vy;
+    const boxV: Tile = {
+      x: x - HALF_W,
+      y: nextY - HALF_H,
+      w: HALF_W * 2,
+      h: HALF_H * 2,
+    };
+    p.onGround = false;
+    for (const t of lvl.platforms) {
+      if (!aabb(boxV, t)) continue;
+      if (vy > 0 && y - HALF_H <= t.y) {
+        nextY = t.y - HALF_H;
+        vy = 0;
+        p.onGround = true;
+      } else if (vy < 0 && y + HALF_H >= t.y + t.h) {
+        nextY = t.y + t.h + HALF_H;
+        vy = 0;
+      }
+      boxV.y = nextY - HALF_H;
+    }
+    let nextX = x + vx;
+    const boxH: Tile = {
+      x: nextX - HALF_W,
+      y: nextY - HALF_H,
+      w: HALF_W * 2,
+      h: HALF_H * 2,
+    };
+    for (const t of lvl.platforms) {
+      if (!aabb(boxH, t)) continue;
+      const movingRight = vx > 0;
+      nextX = movingRight ? t.x - HALF_W : t.x + t.w + HALF_W;
+      vx = 0;
+      boxH.x = nextX - HALF_W;
+    }
+    p.x = clamp(nextX, HALF_W, lvl.size.w - HALF_W);
+    p.y = nextY;
+    p.vx = vx;
+    p.vy = vy;
+  }
 
-          acc -= STEP_MS;
+  function sendChat(text: string) {
+    const trimmed = text.trim().slice(0, 240);
+    if (!trimmed) return;
+    const pkt: ChatPacket = {
+      t: Date.now(),
+      from: { name: myNameRef.current, color: myColorRef.current },
+      text: trimmed,
+    };
+    setChat((prev) => [...prev.slice(-49), pkt]);
+    chanRef.current?.send({ type: "broadcast", event: "CHAT", payload: pkt });
+  }
+
+  function respawn(p: Player) {
+    const lvl = levelRef.current!;
+    const cx = lvl.spawn.x + lvl.spawn.w * 0.5;
+    p.x = cx + (p.id === "p1" ? -18 : 18);
+    p.y = lvl.spawn.y - HALF_H;
+    p.vx = 0;
+    p.vy = 0;
+    p.invulnMs = INVULN_AFTER_DEATH_MS;
+  }
+
+  function takeVoidDamage(p: Player) {
+    if (p.invulnMs > 0) return;
+    p.hp = Math.max(0, p.hp - 1);
+    respawn(p);
+  }
+
+  function tickInvuln(p: Player) {
+    if (p.invulnMs > 0) p.invulnMs = Math.max(0, p.invulnMs - STEP_MS);
+  }
+
+  function onGoal(p: Player) {
+    const lvl = levelRef.current!;
+    const zone: Tile = {
+      x: lvl.goal.x,
+      y: lvl.goal.y - 6,
+      w: lvl.goal.w,
+      h: 10,
+    };
+    return aabb(feetBox(p), zone);
+  }
+
+  function hostIntegrate() {
+    const p1 = p1Ref.current!;
+    const p2 = p2Ref.current!;
+
+    applyInput(p1, inputRef.current);
+    applyInput(p2, inputGuestRef.current);
+
+    p1.vy += GRAV;
+    p2.vy += GRAV;
+
+    p1.vx = clamp(p1.vx, -MAX_VX, MAX_VX);
+    p2.vx = clamp(p2.vx, -MAX_VX, MAX_VX);
+
+    p1.x += p1.vx;
+    p1.y += p1.vy;
+    p2.x += p2.vx;
+    p2.y += p2.vy;
+
+    resolveCollisions(p1);
+    resolveCollisions(p2);
+
+    if (p1.onGround) p1.vx *= FRICTION;
+    if (p2.onGround) p2.vx *= FRICTION;
+
+    tickInvuln(p1);
+    tickInvuln(p2);
+
+    const lvl = levelRef.current!;
+    if (p1.y - HALF_H > lvl.size.h + VOID_FALL_BUFFER) takeVoidDamage(p1);
+    if (p2.y - HALF_H > lvl.size.h + VOID_FALL_BUFFER) takeVoidDamage(p2);
+
+    if (!winRef.current && onGoal(p1) && onGoal(p2)) winRef.current = true;
+
+    updateCamera(p1.x, p2.x);
+  }
+
+  function broadcastState() {
+    const ch = chanRef.current;
+    if (!ch || roleRef.current !== "host") return;
+    const p1 = p1Ref.current!;
+    const p2 = p2Ref.current!;
+    const payload: StatePacket = { t: Date.now(), p1, p2, win: winRef.current };
+    ch.send({ type: "broadcast", event: "STATE", payload });
+  }
+
+  function updateCamera(px1: number, px2: number) {
+    const lvl = levelRef.current!;
+    const minX = Math.min(px1, px2);
+    const maxX = Math.max(px1, px2);
+    let cam = camXRef.current;
+    const leftBound = cam + CAM_MARGIN_L;
+    const rightBound = cam + VIEW_W - CAM_MARGIN_R;
+    if (minX < leftBound) cam -= leftBound - minX;
+    if (maxX > rightBound) cam += maxX - rightBound;
+    cam = clamp(cam, 0, Math.max(0, lvl.size.w - VIEW_W));
+    camXRef.current += (cam - camXRef.current) * 0.18;
+  }
+
+  function drawLevel(ctx: CanvasRenderingContext2D) {
+    const lvl = levelRef.current!;
+    ctx.clearRect(0, 0, VIEW_W, VIEW_H);
+    ctx.save();
+    ctx.translate(-Math.floor(camXRef.current), 0);
+    ctx.fillStyle = "#0b1020";
+    ctx.fillRect(camXRef.current, 0, VIEW_W, VIEW_H);
+    ctx.fillStyle = PLATFORM_COLOR;
+    for (const t of lvl.platforms) ctx.fillRect(t.x, t.y, t.w, t.h);
+    ctx.fillStyle = SPAWN_COLOR;
+    ctx.globalAlpha = 0.9;
+    ctx.fillRect(lvl.spawn.x, lvl.spawn.y, lvl.spawn.w, lvl.spawn.h);
+    const beam = (performance.now() / 300) % 1;
+    ctx.globalAlpha = 0.25 + 0.25 * Math.sin(beam * Math.PI * 2);
+    ctx.fillRect(lvl.spawn.x, lvl.spawn.y - 8, lvl.spawn.w, 6);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = GOAL_COLOR;
+    ctx.fillRect(lvl.goal.x, lvl.goal.y, lvl.goal.w, lvl.goal.h);
+    ctx.restore();
+  }
+
+  function drawHearts(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    n: number,
+    color: string
+  ) {
+    ctx.fillStyle = color;
+    for (let i = 0; i < n; i++) {
+      ctx.beginPath();
+      const px = x + i * 18;
+      ctx.moveTo(px + 6, y + 12);
+      ctx.bezierCurveTo(px - 6, y + 2, px, y - 2, px + 6, y + 4);
+      ctx.bezierCurveTo(px + 12, y - 2, px + 18, y + 2, px + 6, y + 12);
+      ctx.fill();
+    }
+  }
+
+  function drawPlayer(ctx: CanvasRenderingContext2D, p: Player) {
+    ctx.save();
+    ctx.translate(-Math.floor(camXRef.current), 0);
+    ctx.fillStyle = p.color === "blue" ? "#7c9cff" : "#ff9e57";
+    if (p.invulnMs > 0)
+      ctx.globalAlpha = 0.5 + 0.5 * Math.sin((p.invulnMs / 60) * Math.PI);
+    ctx.fillRect(p.x - HALF_W, p.y - HALF_H, HALF_W * 2, HALF_H * 2);
+    ctx.globalAlpha = 1;
+    ctx.font = "12px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto";
+    ctx.textAlign = "center";
+    ctx.fillStyle = "white";
+    ctx.globalAlpha = 0.9;
+    ctx.fillText(p.name, p.x, p.y - HALF_H - 8);
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  function drawWinOverlay(ctx: CanvasRenderingContext2D) {
+    ctx.fillStyle = "rgba(0,0,0,0.6)";
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    ctx.fillStyle = "#fff";
+    ctx.font = "28px ui-sans-serif, system-ui";
+    ctx.textAlign = "center";
+    ctx.fillText("You both reached the goal!", VIEW_W / 2, 140);
+    const btnW = 220;
+    const btnH = 44;
+    const bx = VIEW_W / 2 - btnW / 2;
+    const by = 180;
+    ctx.fillStyle = "#22c55e";
+    ctx.fillRect(bx, by, btnW, btnH);
+    ctx.fillStyle = "#0b1020";
+    ctx.font = "16px ui-sans-serif, system-ui";
+    ctx.fillText("Back to Main", VIEW_W / 2, by + 28);
+    const c = canvasRef.current;
+    if (c) {
+      c.onclick = (ev) => {
+        const rect = c.getBoundingClientRect();
+        const x = ev.clientX - rect.left;
+        const y = ev.clientY - rect.top;
+        if (x >= bx && x <= bx + btnW && y >= by && y <= by + btnH) {
+          c.onclick = null!;
+          r.push(`/`);
         }
+      };
+    }
+  }
 
-        // broadcast ~20Hz
-        if (snapTimer >= 80) {
-          const snap: Snapshot = {
-            t: Date.now(),
-            p1: p1Ref.current as Player,
-            p2: p2Ref.current as Player,
-            gates: level.gates.map((g) => ({ open: g.open })),
-            switches: level.pads.map((s) => ({ pressed: s.pressed })),
-            enemies: level.enemies.map((e) => ({ ...e })),
-            particles: particlesRef.current.map((p) => ({ ...p })),
-            gameOver: gameOverRef.current,
-          };
-          chanRef.current?.send({
-            type: "broadcast",
-            event: "SNAP",
-            payload: snap,
-          });
+  function drawHost() {
+    const ctx = ctxRef.current!;
+    drawLevel(ctx);
+    drawPlayer(ctx, p1Ref.current!);
+    drawPlayer(ctx, p2Ref.current!);
+    drawHearts(ctx, 12, 10, Math.max(0, p1Ref.current!.hp), "#7c9cff");
+    drawHearts(
+      ctx,
+      VIEW_W - 12 - 18 * Math.max(0, p2Ref.current!.hp),
+      10,
+      Math.max(0, p2Ref.current!.hp),
+      "#ff9e57"
+    );
+    if (winRef.current) drawWinOverlay(ctx);
+  }
 
-          // optional: redundant GAMEOVER to cover packet loss
-          if (gameOverRef.current) {
-            chanRef.current?.send({
-              type: "broadcast",
-              event: "GAMEOVER",
-              payload: {},
-            });
-          }
+  function drawGuest() {
+    const ctx = ctxRef.current!;
+    const prev = stPrevRef.current;
+    const curr = stCurrRef.current;
+    const guestNowHostClock = Date.now() + hostOffsetRef.current;
+    const renderT = guestNowHostClock - renderDelayRef.current;
 
-          snapTimer = 0;
-        }
+    let drawP1: Player | null = null;
+    let drawP2: Player | null = null;
+    let winNow = false;
+
+    if (prev && curr) {
+      const span = Math.max(1, curr.hostT - prev.hostT);
+      let t = (renderT - prev.hostT) / span;
+      if (t < 0) t = 0;
+      if (t <= 1) {
+        drawP1 = {
+          ...curr.p1,
+          x: lerp(prev.p1.x, curr.p1.x, t),
+          y: lerp(prev.p1.y, curr.p1.y, t),
+          vx: lerp(prev.p1.vx, curr.p1.vx, t),
+          vy: lerp(prev.p1.vy, curr.p1.vy, t),
+          onGround: t < 0.5 ? prev.p1.onGround : curr.p1.onGround,
+        };
+        drawP2 = {
+          ...curr.p2,
+          x: lerp(prev.p2.x, curr.p2.x, t),
+          y: lerp(prev.p2.y, curr.p2.y, t),
+          vx: lerp(prev.p2.vx, curr.p2.vx, t),
+          vy: lerp(prev.p2.vy, curr.p2.vy, t),
+          onGround: t < 0.5 ? prev.p2.onGround : curr.p2.onGround,
+        };
+        winNow = curr.win;
       } else {
-        while (acc >= STEP_MS) {
-          const meIsP1 = meColorRef.current === "blue";
-          const me = meIsP1
-            ? (p1Ref.current as Player)
-            : (p2Ref.current as Player);
-          const them = meIsP1
-            ? (p2Ref.current as Player)
-            : (p1Ref.current as Player);
-
-          // 1) Predict myself locally (no hazards/pads on guest)
-          integrate(me, inputRef.current, { hazards: false, pads: false });
-
-          // 1.5) Reconcile myself toward host target to kill divergence
-          const myTgt = meIsP1 ? targetP1Ref.current : targetP2Ref.current;
-          if (myTgt) {
-            const dx = myTgt.x - me.x;
-            const dy = myTgt.y - me.y;
-            const dist2 = dx * dx + dy * dy;
-
-            // if way off (e.g., host resolved a collision I didn't): snap
-            if (dist2 > 24 * 24) {
-              Object.assign(me, {
-                x: myTgt.x,
-                y: myTgt.y,
-                vx: myTgt.vx,
-                vy: myTgt.vy,
-                onGround: myTgt.onGround,
-                lives: myTgt.lives,
-                invulnMs: myTgt.invulnMs,
-                name: myTgt.name,
-              });
-            } else {
-              // otherwise gently steer (keeps it responsive but convergent)
-              const kSelf = 0.12;
-              me.x += dx * kSelf;
-              me.y += dy * kSelf;
-              me.vx = myTgt.vx;
-              me.vy = myTgt.vy;
-              me.onGround = myTgt.onGround;
-              me.lives = myTgt.lives;
-              me.invulnMs = myTgt.invulnMs;
-              me.name = myTgt.name;
-            }
-          }
-
-          // 2) Smooth other player using buffered interpolation (no spring jitter)
-          const op = otherPrevRef.current;
-          const oc = otherCurrRef.current;
-          if (op && oc) {
-            const renderT = performance.now() - interpDelayMsRef.current;
-            const span = Math.max(1, oc.t - op.t);
-            const t = clamp((renderT - op.t) / span, 0, 1);
-
-            // interpolate position; take latest non-pos fields from current
-            const a = op.p,
-              b = oc.p;
-            let ix = a.x + (b.x - a.x) * t;
-            let iy = a.y + (b.y - a.y) * t;
-            // tiny dead-reckoning to counter residual trail (≈1 frame at 60Hz)
-            const EXTRAP_MS = 16;
-            const k = EXTRAP_MS / STEP_MS; // STEP_MS is 1000/60
-            ix += b.vx * k;
-            iy += b.vy * k;
-            them.x = ix;
-            them.y = iy;
-
-            // optional: lightly blend velocity to match host feel
-            them.vx = b.vx;
-            them.vy = b.vy;
-            them.onGround = b.onGround;
-            them.lives = b.lives;
-            them.invulnMs = b.invulnMs;
-            them.name = b.name;
-          } else {
-            // fallback to latest known target if buffer not ready
-            const fallback = meIsP1 ? targetP2Ref.current : targetP1Ref.current;
-            if (fallback) {
-              them.x = fallback.x;
-              them.y = fallback.y;
-              them.vx = fallback.vx;
-              them.vy = fallback.vy;
-              them.onGround = fallback.onGround;
-              them.lives = fallback.lives;
-              them.invulnMs = fallback.invulnMs;
-              them.name = fallback.name;
-            }
-          }
-
-          acc -= STEP_MS;
-        }
-      }
-      // stream minimal poses at ~60Hz (keeps guest "other player" 1:1 smooth)
-      // host streams minimal poses at ~60Hz (keeps guest "other player" smooth)
-      if (isHost && poseTimer >= 16 && chanRef.current) {
-        const p1 = p1Ref.current as Player;
-        const p2 = p2Ref.current as Player;
-
-        const pose1: Pose = {
-          t: Date.now(),
-          p: {
-            id: "p1",
-            x: p1.x,
-            y: p1.y,
-            vx: p1.vx,
-            vy: p1.vy,
-            onGround: p1.onGround,
-            name: p1.name,
-          },
+        const aheadMs = Math.min(EXTRAPOLATE_CAP_MS, renderT - curr.hostT);
+        const k = aheadMs / STEP_MS;
+        drawP1 = {
+          ...curr.p1,
+          x: curr.p1.x + curr.p1.vx * k,
+          y: curr.p1.y + curr.p1.vy * k,
         };
-        const pose2: Pose = {
-          t: Date.now(),
-          p: {
-            id: "p2",
-            x: p2.x,
-            y: p2.y,
-            vx: p2.vx,
-            vy: p2.vy,
-            onGround: p2.onGround,
-            name: p2.name,
-          },
+        drawP2 = {
+          ...curr.p2,
+          x: curr.p2.x + curr.p2.vx * k,
+          y: curr.p2.y + curr.p2.vy * k,
         };
-
-        chanRef.current.send({
-          type: "broadcast",
-          event: "POSE",
-          payload: pose1,
-        });
-        chanRef.current.send({
-          type: "broadcast",
-          event: "POSE",
-          payload: pose2,
-        });
-
-        poseTimer = 0;
+        winNow = curr.win;
       }
+    } else {
+      const st = latestStateRef.current;
+      if (st) {
+        drawP1 = st.p1;
+        drawP2 = st.p2;
+        winNow = st.win;
+      }
+    }
 
-      // camera keeps both visible
-      const p1 = p1Ref.current as Player,
-        p2 = p2Ref.current as Player;
-      const minX = Math.min(p1.x, p2.x),
-        maxX = Math.max(p1.x, p2.x);
-      let cam = camXRef.current;
-      const leftBound = cam + MARGIN_L,
-        rightBound = cam + VIEW_W - MARGIN_R;
-      if (minX < leftBound) cam -= leftBound - minX;
-      if (maxX > rightBound) cam += maxX - rightBound;
-      cam = clamp(cam, 0, level.size.pxWidth - VIEW_W);
-      camXRef.current += (cam - camXRef.current) * 0.18;
+    if (!drawP1 || !drawP2) {
+      ctx.clearRect(0, 0, VIEW_W, VIEW_H);
+      ctx.fillStyle = "#0b1020";
+      ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+      ctx.fillStyle = "white";
+      ctx.globalAlpha = 0.8;
+      ctx.font = "16px ui-sans-serif, system-ui";
+      ctx.textAlign = "center";
+      ctx.fillText("Waiting for host…", VIEW_W / 2, VIEW_H / 2 - 20);
+      ctx.globalAlpha = 1;
+      return;
+    }
 
-      drawFrame();
-      reqRef.current = requestAnimationFrame(loop);
-    };
+    updateCamera(drawP1.x, drawP2.x);
 
-    reqRef.current = requestAnimationFrame(loop);
-    return () => {
-      if (reqRef.current) cancelAnimationFrame(reqRef.current);
-    };
-  }, [level, isHost, integrate, spawnPlayers, r]);
+    drawLevel(ctx);
+    drawPlayer(ctx, drawP1);
+    drawPlayer(ctx, drawP2);
+    drawHearts(ctx, 12, 10, Math.max(0, drawP1.hp), "#7c9cff");
+    drawHearts(
+      ctx,
+      VIEW_W - 12 - 18 * Math.max(0, drawP2.hp),
+      10,
+      Math.max(0, drawP2.hp),
+      "#ff9e57"
+    );
+    if (winNow) drawWinOverlay(ctx);
+  }
 
-  if (!seed || !level) return <main className="pt-8">Loading…</main>;
+  const title = useMemo(
+    () =>
+      roleRef.current === "host"
+        ? "Plane — Host (Blue)"
+        : "Plane — Guest (Orange)",
+    []
+  );
 
   return (
     <main className="pt-4">
       <div className="flex items-baseline justify-between">
-        <h1 className="text-xl font-semibold">Game — Lobby #{code}</h1>
+        <h1 className="text-xl font-semibold">
+          {title} — Lobby #{code}
+        </h1>
         <button
           className="text-white/60 hover:text-white"
           onClick={() => r.push(`/lobby/${code}`)}
@@ -1306,12 +918,51 @@ export default function GamePage({
       <div className="mt-3 overflow-auto rounded-xl2 border border-[#23283a] bg-[#0b1020]">
         <canvas ref={canvasRef} />
       </div>
-      <p className="mt-2 text-white/60 text-sm">
-        Reach the exit together. Stand on your color pads to open matching
-        gates. Avoid <span style={{ color: "#a6242b" }}>lava</span> and
-        <span style={{ color: "#ffd84d" }}> bots</span>. Falling costs a heart;
-        you’ll respawn near your partner.
-      </p>
+      <div className="mt-2 grid grid-cols-1 gap-2 md:grid-cols-3">
+        <div className="md:col-span-2" />
+        <div className="rounded-lg border border-[#23283a]">
+          <div
+            ref={chatScrollRef}
+            className="h-40 overflow-y-auto bg-[#0b1020]/80 p-2"
+          >
+            {chat.map((m) => (
+              <div key={`${m.t}-${m.from.name}`} className="mb-1 text-sm">
+                <span
+                  className="font-semibold"
+                  style={{
+                    color: m.from.color === "blue" ? "#7c9cff" : "#ff9e57",
+                  }}
+                >
+                  {m.from.name}
+                </span>
+                <span className="text-white/70">: {m.text}</span>
+              </div>
+            ))}
+          </div>
+          <form
+            className="flex gap-2 border-t border-[#23283a] p-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              const v = chatInputRef.current?.value || "";
+              sendChat(v);
+              if (chatInputRef.current) chatInputRef.current.value = "";
+            }}
+          >
+            <input
+              ref={chatInputRef}
+              type="text"
+              placeholder="Type message…"
+              className="w-full rounded-md bg-[#0b1020] px-2 py-1 text-sm outline-none placeholder:text-white/40"
+            />
+            <button
+              type="submit"
+              className="rounded-md bg-[#22c55e] px-3 py-1 text-sm text-black"
+            >
+              Send
+            </button>
+          </form>
+        </div>
+      </div>
     </main>
   );
 }
