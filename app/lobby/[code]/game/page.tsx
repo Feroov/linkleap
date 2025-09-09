@@ -54,6 +54,11 @@ type PongPacket = {
   pongHostAt: number;
 };
 
+type TypingPacket = {
+  t: number;
+  from: { name: string; color: Color };
+};
+
 const VIEW_W = 960;
 const VIEW_H = 540;
 const HALF_W = 12;
@@ -188,6 +193,15 @@ export default function Page({
   const chatInputRef = useRef<HTMLInputElement | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
 
+  const startedRef = useRef<boolean>(false);
+  const lastKnownNamesRef = useRef<{ blue?: string; orange?: string }>({});
+
+  const [typing, setTyping] = useState<Record<string, number>>({});
+  const typingDebounceRef = useRef<number | null>(null);
+
+  const [ctxReady, setCtxReady] = useState(false);
+  const [levelReady, setLevelReady] = useState(false);
+
   useEffect(() => {
     const qs =
       typeof window !== "undefined"
@@ -202,7 +216,13 @@ export default function Page({
 
   useEffect(() => {
     levelRef.current = genLevel(code);
+    setLevelReady(true); // ✅ signal ready
   }, [code]);
+
+  useEffect(() => {
+    const box = chatScrollRef.current;
+    if (box) box.scrollTop = box.scrollHeight;
+  }, [chat]);
 
   useEffect(() => {
     const c = canvasRef.current;
@@ -212,6 +232,25 @@ export default function Page({
     const ctx = c.getContext("2d");
     if (!ctx) return;
     ctxRef.current = ctx;
+    setCtxReady(true);
+  }, []);
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const now = Date.now();
+      setTyping((prev) => {
+        const next = { ...prev };
+        let changed = false;
+        for (const [k, until] of Object.entries(prev)) {
+          if (until <= now) {
+            delete next[k];
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+    }, 500);
+    return () => clearInterval(id);
   }, []);
 
   useEffect(() => {
@@ -250,6 +289,23 @@ export default function Page({
 
     ch.on(
       "broadcast",
+      { event: "NAME_SYNC" },
+      ({
+        payload,
+      }: {
+        payload: { t: number; blue: string; orange: string };
+      }) => {
+        // Update caches + live objects if they exist
+        lastKnownNamesRef.current.blue = payload.blue;
+        lastKnownNamesRef.current.orange = payload.orange;
+
+        if (p1Ref.current) p1Ref.current.name = payload.blue;
+        if (p2Ref.current) p2Ref.current.name = payload.orange;
+      }
+    );
+
+    ch.on(
+      "broadcast",
       { event: "INPUT" },
       ({ payload }: { payload: InputPacket }) => {
         if (roleRef.current !== "host") return;
@@ -269,10 +325,32 @@ export default function Page({
         payload: { color: Color; name: string; role: Role };
       }) => {
         if (roleRef.current !== "host") return;
-        if (payload.color === "blue" && p1Ref.current)
-          p1Ref.current.name = payload.name;
-        if (payload.color === "orange" && p2Ref.current)
-          p2Ref.current.name = payload.name;
+
+        if (payload.color === "blue") {
+          if (p1Ref.current) p1Ref.current.name = payload.name;
+          lastKnownNamesRef.current.blue = payload.name;
+        }
+        if (payload.color === "orange") {
+          if (p2Ref.current) p2Ref.current.name = payload.name;
+          lastKnownNamesRef.current.orange = payload.name;
+        }
+
+        // Tell everyone the authoritative names (covers late joins / re-syncs)
+        chanRef.current?.send({
+          type: "broadcast",
+          event: "NAME_SYNC",
+          payload: {
+            t: Date.now(),
+            blue:
+              p1Ref.current?.name ??
+              lastKnownNamesRef.current.blue ??
+              "Blue Player",
+            orange:
+              p2Ref.current?.name ??
+              lastKnownNamesRef.current.orange ??
+              "Guest",
+          },
+        });
       }
     );
 
@@ -314,6 +392,17 @@ export default function Page({
           const box = chatScrollRef.current;
           if (box) box.scrollTop = box.scrollHeight;
         });
+      }
+    );
+
+    ch.on(
+      "broadcast",
+      { event: "TYPING" },
+      ({ payload }: { payload: TypingPacket }) => {
+        setTyping((prev) => ({
+          ...prev,
+          [payload.from.name]: Date.now() + 2000,
+        }));
       }
     );
 
@@ -468,18 +557,27 @@ export default function Page({
   }, []);
 
   useEffect(() => {
+    if (startedRef.current) return;
+    if (!ctxReady || !levelReady) return;
+
     const isHost = roleRef.current === "host";
-    if (!ctxRef.current || !levelRef.current) return;
+
+    // restore last known names if we had them (helps if something ever re-inits)
+    const blueName =
+      lastKnownNamesRef.current.blue ??
+      (roleRef.current === "host" ? myNameRef.current : "Blue Player");
+    const orangeName = lastKnownNamesRef.current.orange ?? "Guest";
 
     if (isHost) {
-      const lvl = levelRef.current;
-      const cx = lvl!.spawn.x + lvl!.spawn.w * 0.5;
+      const lvl = levelRef.current!;
+      const cx = lvl.spawn.x + lvl.spawn.w * 0.5;
+
       p1Ref.current = {
         id: "p1",
         color: "blue",
-        name: myNameRef.current,
+        name: blueName,
         x: cx - 18,
-        y: lvl!.spawn.y - HALF_H,
+        y: lvl.spawn.y - HALF_H,
         vx: 0,
         vy: 0,
         onGround: true,
@@ -489,9 +587,9 @@ export default function Page({
       p2Ref.current = {
         id: "p2",
         color: "orange",
-        name: "Guest",
+        name: orangeName,
         x: cx + 18,
-        y: lvl!.spawn.y - HALF_H,
+        y: lvl.spawn.y - HALF_H,
         vx: 0,
         vy: 0,
         onGround: true,
@@ -505,10 +603,13 @@ export default function Page({
       startGuestLoop();
     }
 
+    startedRef.current = true;
+
     return () => {
+      // don’t reset startedRef to avoid accidental re-inits
       stopLoop();
     };
-  }, [ctxRef.current, levelRef.current]);
+  }, [ctxReady, levelReady]);
 
   function stopLoop() {
     if (rafRef.current) {
@@ -894,13 +995,14 @@ export default function Page({
     if (winNow) drawWinOverlay(ctx);
   }
 
-  const title = useMemo(
-    () =>
+  const [title, setTitle] = useState("Plane — Guest (Orange)");
+  useEffect(() => {
+    setTitle(
       roleRef.current === "host"
         ? "Plane — Host (Blue)"
-        : "Plane — Guest (Orange)",
-    []
-  );
+        : "Plane — Guest (Orange)"
+    );
+  }, []);
 
   return (
     <main className="pt-4">
@@ -939,6 +1041,22 @@ export default function Page({
               </div>
             ))}
           </div>
+          {/* typing indicator */}
+          {Object.keys(typing).length > 0 && (
+            <div className="border-t border-[#23283a] px-2 py-1 text-xs text-white/70">
+              {Object.keys(typing)
+                .slice(0, 3)
+                .map((n, i, arr) => (
+                  <span key={n}>
+                    {n}
+                    {i < arr.length - 1 ? ", " : ""}
+                  </span>
+                ))}
+              {Object.keys(typing).length > 3 ? " and others " : " "}
+              is typing…
+            </div>
+          )}
+
           <form
             className="flex gap-2 border-t border-[#23283a] p-2"
             onSubmit={(e) => {
@@ -946,6 +1064,11 @@ export default function Page({
               const v = chatInputRef.current?.value || "";
               sendChat(v);
               if (chatInputRef.current) chatInputRef.current.value = "";
+              // ensure scroll after local send
+              requestAnimationFrame(() => {
+                const box = chatScrollRef.current;
+                if (box) box.scrollTop = box.scrollHeight;
+              });
             }}
           >
             <input
@@ -953,7 +1076,50 @@ export default function Page({
               type="text"
               placeholder="Type message…"
               className="w-full rounded-md bg-[#0b1020] px-2 py-1 text-sm outline-none placeholder:text-white/40"
+              onChange={() => {
+                if (typingDebounceRef.current) return;
+                typingDebounceRef.current = window.setTimeout(() => {
+                  typingDebounceRef.current = null;
+                }, 500);
+
+                const pkt: TypingPacket = {
+                  t: Date.now(),
+                  from: { name: myNameRef.current, color: myColorRef.current },
+                };
+                chanRef.current?.send({
+                  type: "broadcast",
+                  event: "TYPING",
+                  payload: pkt,
+                });
+
+                // also reflect locally (so you see your own indicator instantly)
+                setTyping((prev) => ({
+                  ...prev,
+                  [pkt.from.name]: Date.now() + 2000,
+                }));
+              }}
+              onKeyDown={() => {
+                // same behavior as onChange to handle cases where value didn't change yet
+                if (typingDebounceRef.current) return;
+                typingDebounceRef.current = window.setTimeout(() => {
+                  typingDebounceRef.current = null;
+                }, 500);
+                const pkt: TypingPacket = {
+                  t: Date.now(),
+                  from: { name: myNameRef.current, color: myColorRef.current },
+                };
+                chanRef.current?.send({
+                  type: "broadcast",
+                  event: "TYPING",
+                  payload: pkt,
+                });
+                setTyping((prev) => ({
+                  ...prev,
+                  [pkt.from.name]: Date.now() + 2000,
+                }));
+              }}
             />
+
             <button
               type="submit"
               className="rounded-md bg-[#22c55e] px-3 py-1 text-sm text-black"
