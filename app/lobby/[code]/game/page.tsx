@@ -4,6 +4,7 @@ export const dynamic = "force-dynamic";
 import { use as useUnwrap, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
+import { nanoid } from "nanoid/non-secure";
 
 type Role = "host" | "guest";
 type Color = "blue" | "orange";
@@ -58,6 +59,23 @@ type TypingPacket = {
   t: number;
   from: { name: string; color: Color };
 };
+
+// --- Rope state ---
+type RopeNode = { x: number; y: number; px: number; py: number }; // Verlet
+const rope: RopeNode[] = []; // N nodes between players
+let segLen = 0; // rest length per segment
+const ROPE_N = 10; // try 8–14
+const ROPE_ITERS = 6; // constraint passes per frame
+const ROPE_COMPLIANCE = 0.0; // 0 => classic PBD; >0 => XPBD-like “softness”
+
+const ROPE_MAX_LEN = 490;
+const ROPE_STIFFNESS = 2.7;
+const ROPE_DAMPING = 0.35;
+const ROPE_SOLVER_ITERS = 3;
+
+const PEER_GONE_GRACE_MS = 6000; // presence says someone left for > this → exit
+const HOST_STALL_MS = 8000; // guest: no STATE from host for > this → exit
+const GUEST_STALL_MS = 8000;
 
 const VIEW_W = 960;
 const VIEW_H = 540;
@@ -169,7 +187,7 @@ export default function Page({
   const inputRef = useRef<Input>({ left: false, right: false, jump: false });
   const inputSeqRef = useRef<number>(0);
   const keepAliveTimerRef = useRef<number | null>(null);
-
+  const ropeLenRef = useRef<number>(ROPE_MAX_LEN);
   const p1Ref = useRef<Player | null>(null);
   const p2Ref = useRef<Player | null>(null);
 
@@ -201,6 +219,10 @@ export default function Page({
 
   const [ctxReady, setCtxReady] = useState(false);
   const [levelReady, setLevelReady] = useState(false);
+
+  const myPeerIdRef = useRef<string>(nanoid(16));
+  const peerGoneAtRef = useRef<number | null>(null);
+  const lastStateFromHostAtRef = useRef<number>(performance.now());
 
   useEffect(() => {
     const qs =
@@ -255,14 +277,39 @@ export default function Page({
 
   useEffect(() => {
     const ch = supabase.channel(`plane:${code}`, {
-      config: { broadcast: { self: false } },
+      config: {
+        broadcast: { self: false },
+        presence: { key: myPeerIdRef.current }, // NEW: unique presence key
+      },
     });
+
     chanRef.current = ch;
+
+    // ADD: presence sync handler — fires on joins/leaves/sync
+    ch.on("presence", { event: "sync" }, () => {
+      // Presence state is: Record<key, Array<meta>>
+      const state = ch.presenceState() as Record<
+        string,
+        Array<{ role: Role; color: Color; name: string }>
+      >;
+      const memberCount = Object.keys(state).length;
+
+      if (memberCount < 2) {
+        // start (or continue) the peer-gone timer
+        if (!peerGoneAtRef.current) peerGoneAtRef.current = Date.now();
+      } else {
+        // both present; clear any pending timer
+        peerGoneAtRef.current = null;
+      }
+    });
 
     ch.on(
       "broadcast",
       { event: "STATE" },
       ({ payload }: { payload: StatePacket }) => {
+        // ADD:
+        lastStateFromHostAtRef.current = performance.now();
+
         if (roleRef.current !== "guest") return;
         const hostT = payload.t;
         const pkt = { ...payload, hostT };
@@ -405,6 +452,9 @@ export default function Page({
         }));
       }
     );
+    ch.on("broadcast", { event: "END" }, () => {
+      r.push(`/`);
+    });
 
     ch.subscribe((status) => {
       if (status === "SUBSCRIBED") {
@@ -417,6 +467,16 @@ export default function Page({
             role: roleRef.current,
           },
         });
+
+        if (status === "SUBSCRIBED") {
+          // START tracking presence on this channel
+          ch.track({
+            role: roleRef.current,
+            color: myColorRef.current,
+            name: myNameRef.current,
+          }); // returns a status; awaiting is optional
+        }
+
         if (roleRef.current === "guest") {
           const id = window.setInterval(() => {
             ch.send({
@@ -436,6 +496,10 @@ export default function Page({
         clearInterval(id);
         pingIntervalIdRef.current = null;
       }
+
+      // fire-and-forget: don't make cleanup async
+      chanRef.current?.untrack().catch(() => {});
+
       ch.unsubscribe();
     };
   }, [code]);
@@ -445,6 +509,29 @@ export default function Page({
     right: false,
     jump: false,
   });
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      // 1) presence-based: the reliable path
+      if (
+        peerGoneAtRef.current &&
+        Date.now() - peerGoneAtRef.current > PEER_GONE_GRACE_MS
+      ) {
+        r.push(`/`);
+        return;
+      }
+
+      // 2) timeouts as a fallback (covers rare cases where presence is late)
+      const now = performance.now();
+      if (roleRef.current === "guest") {
+        if (now - lastStateFromHostAtRef.current > HOST_STALL_MS) r.push(`/`);
+      } else {
+        if (now - lastGuestInputAtRef.current > GUEST_STALL_MS) r.push(`/`);
+      }
+    }, 500);
+
+    return () => clearInterval(id);
+  }, []);
 
   useEffect(() => {
     const sendGuestInput = () => {
@@ -596,6 +683,9 @@ export default function Page({
         hp: START_HP,
         invulnMs: 0,
       };
+      const dx0 = p2Ref.current.x - p1Ref.current.x;
+      const dy0 = p2Ref.current.y - p1Ref.current.y;
+      ropeLenRef.current = ROPE_MAX_LEN; // a bit of slack
       camXRef.current = 0;
       startHostLoop();
     } else {
@@ -654,6 +744,7 @@ export default function Page({
   function applyInput(p: Player, i: Input) {
     if (i.left) p.vx -= MOVE;
     if (i.right) p.vx += MOVE;
+
     if (i.jump && p.onGround) {
       p.vy = JUMP_VY;
       p.onGround = false;
@@ -676,7 +767,8 @@ export default function Page({
     p.onGround = false;
     for (const t of lvl.platforms) {
       if (!aabb(boxV, t)) continue;
-      if (vy > 0 && y - HALF_H <= t.y) {
+      const EPS = 0.5; // small snap tolerance
+      if (vy >= 0 && y - HALF_H <= t.y + EPS) {
         nextY = t.y - HALF_H;
         vy = 0;
         p.onGround = true;
@@ -704,6 +796,34 @@ export default function Page({
     p.y = nextY;
     p.vx = vx;
     p.vy = vy;
+  }
+
+  function recheckGroundAndSnap(p: Player) {
+    const lvl = levelRef.current!;
+    const EPS = 1.0; // tolerance to treat as standing
+    p.onGround = false;
+
+    // narrow AABB under the player
+    const feet = {
+      x: p.x - HALF_W + 1,
+      y: p.y + HALF_H - 1,
+      w: HALF_W * 2 - 2,
+      h: 3,
+    } as Tile;
+
+    for (const t of lvl.platforms) {
+      // horizontally overlapping?
+      if (feet.x < t.x + t.w && feet.x + feet.w > t.x) {
+        // is player close to or barely inside the top surface?
+        const gap = t.y - (p.y + HALF_H);
+        if (gap >= -EPS && gap <= EPS) {
+          p.y = t.y - HALF_H; // snap on top
+          p.vy = 0;
+          p.onGround = true;
+          break;
+        }
+      }
+    }
   }
 
   function sendChat(text: string) {
@@ -767,9 +887,22 @@ export default function Page({
     p2.x += p2.vx;
     p2.y += p2.vy;
 
+    // 1) primary collision solve
     resolveCollisions(p1);
     resolveCollisions(p2);
 
+    // 2) rope constraint (with light collision pass inside)
+    for (let k = 0; k < ROPE_SOLVER_ITERS; k++) {
+      enforceRope(p1, p2);
+      resolveCollisions(p1);
+      resolveCollisions(p2);
+    }
+
+    // 3) FINAL ground recheck after all positional corrections
+    recheckGroundAndSnap(p1);
+    recheckGroundAndSnap(p2);
+
+    // 4) apply friction based on the final onGround state
     if (p1.onGround) p1.vx *= FRICTION;
     if (p2.onGround) p2.vx *= FRICTION;
 
@@ -781,6 +914,17 @@ export default function Page({
     if (p2.y - HALF_H > lvl.size.h + VOID_FALL_BUFFER) takeVoidDamage(p2);
 
     if (!winRef.current && onGoal(p1) && onGoal(p2)) winRef.current = true;
+    // after players move + collide:
+    if (rope.length === 0) ropeInit(p1, p2);
+    ropeIntegrate(STEP_MS / 16.67);
+    ropeSatisfyConstraints(p1, p2);
+
+    // optional: let the rope gently pull players (soft coupling)
+    const end = rope[ROPE_N];
+    const dx = end.x - p2.x,
+      dy = end.y - p2.y;
+    p2.vx += dx * 0.02;
+    p2.vy += dy * 0.02; // tiny spring toward rope end
 
     updateCamera(p1.x, p2.x);
   }
@@ -846,20 +990,68 @@ export default function Page({
     }
   }
 
+  // ADD — simple straight rope segment between players
+  function drawRope(ctx: CanvasRenderingContext2D, p1: Player, p2: Player) {
+    ctx.save();
+    ctx.translate(-Math.floor(camXRef.current), 0);
+    ctx.beginPath();
+    ctx.moveTo(p1.x, p1.y);
+    ctx.lineTo(p2.x, p2.y);
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "#fac425";
+    ctx.globalAlpha = 0.9;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // CHANGE — draw player + face
   function drawPlayer(ctx: CanvasRenderingContext2D, p: Player) {
     ctx.save();
     ctx.translate(-Math.floor(camXRef.current), 0);
-    ctx.fillStyle = p.color === "blue" ? "#7c9cff" : "#ff9e57";
+
+    // body
+    const body = p.color === "blue" ? "#7c9cff" : "#ff9e57";
+    ctx.fillStyle = body;
     if (p.invulnMs > 0)
       ctx.globalAlpha = 0.5 + 0.5 * Math.sin((p.invulnMs / 60) * Math.PI);
     ctx.fillRect(p.x - HALF_W, p.y - HALF_H, HALF_W * 2, HALF_H * 2);
     ctx.globalAlpha = 1;
+
+    // face (simple smiley)
+    const cx = p.x;
+    const cy = p.y - 2; // a hair above center
+    const eyeOffsetX = 5.5;
+    const eyeOffsetY = 6.5;
+    const eyeR = 1.8;
+
+    // eyes
+    ctx.fillStyle = "#0b1020";
+    ctx.beginPath();
+    ctx.arc(cx - eyeOffsetX, cy - eyeOffsetY, eyeR, 0, Math.PI * 2);
+    ctx.arc(cx + eyeOffsetX, cy - eyeOffsetY, eyeR, 0, Math.PI * 2);
+    ctx.fill();
+
+    // mouth
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "#0b1020";
+    ctx.beginPath();
+    if (p.color === "orange") {
+      // bigger grin
+      ctx.arc(cx, cy + 2.5, 6.5, 0.15 * Math.PI, 0.85 * Math.PI, false);
+    } else {
+      // subtle smile
+      ctx.arc(cx, cy + 3.5, 5, 0.2 * Math.PI, 0.8 * Math.PI, false);
+    }
+    ctx.stroke();
+
+    // name
     ctx.font = "12px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto";
     ctx.textAlign = "center";
     ctx.fillStyle = "white";
     ctx.globalAlpha = 0.9;
     ctx.fillText(p.name, p.x, p.y - HALF_H - 8);
     ctx.globalAlpha = 1;
+
     ctx.restore();
   }
 
@@ -896,6 +1088,7 @@ export default function Page({
   function drawHost() {
     const ctx = ctxRef.current!;
     drawLevel(ctx);
+    drawRope(ctx, p1Ref.current!, p2Ref.current!);
     drawPlayer(ctx, p1Ref.current!);
     drawPlayer(ctx, p2Ref.current!);
     drawHearts(ctx, 12, 10, Math.max(0, p1Ref.current!.hp), "#7c9cff");
@@ -982,6 +1175,7 @@ export default function Page({
     updateCamera(drawP1.x, drawP2.x);
 
     drawLevel(ctx);
+    drawRope(ctx, drawP1, drawP2);
     drawPlayer(ctx, drawP1);
     drawPlayer(ctx, drawP2);
     drawHearts(ctx, 12, 10, Math.max(0, drawP1.hp), "#7c9cff");
@@ -1003,6 +1197,125 @@ export default function Page({
         : "Plane — Guest (Orange)"
     );
   }, []);
+
+  // ADD — adjust velocities along rope to avoid oscillations
+  function dampAlongRope(p1: Player, p2: Player, nx: number, ny: number) {
+    // relative velocity along rope
+    const rvx = p2.vx - p1.vx;
+    const rvy = p2.vy - p1.vy;
+    const rel = rvx * nx + rvy * ny; // >0 means separating along rope
+    if (rel <= 0) return; // don’t damp when moving together
+    const kill = rel * ROPE_DAMPING;
+
+    // distribute equally (equal mass)
+    const dvx = kill * nx * 0.5;
+    const dvy = kill * ny * 0.5;
+
+    p1.vx += dvx;
+    p1.vy += dvy; // move toward each other if separating too fast
+    p2.vx -= dvx;
+    p2.vy -= dvy;
+  }
+
+  // ADD — position-based rope constraint (cap max distance; gentle pull)
+  function enforceRope(p1: Player, p2: Player) {
+    // Distance
+    const dx = p2.x - p1.x;
+    const dy = p2.y - p1.y;
+    const dist = Math.hypot(dx, dy);
+
+    // Early-outs / guards
+    const maxLen = ropeLenRef.current ?? ROPE_MAX_LEN;
+    if (dist <= maxLen) return;
+    if (dist < 1e-4) return; // avoid NaN normals
+
+    // Normal from p1 -> p2
+    const nx = dx / dist;
+    const ny = dy / dist;
+
+    // Excess beyond the allowed length
+    const excess = dist - maxLen;
+
+    // Split the correction (equal mass); limit per-iter to avoid "yeet"
+    let corr = excess * 0.5 * ROPE_STIFFNESS;
+    const MAX_CORR_PER_ITER = 12; // pixels – safety clamp
+    if (corr > MAX_CORR_PER_ITER) corr = MAX_CORR_PER_ITER;
+
+    // IMPORTANT: move the players TOWARD each other (fixes your sign)
+    p1.x += nx * corr;
+    p1.y += ny * corr;
+    p2.x -= nx * corr;
+    p2.y -= ny * corr;
+
+    // Damp relative velocity along rope axis (reduces oscillations)
+    dampAlongRope(p1, p2, nx, ny);
+  }
+
+  function ropeInit(p1: Player, p2: Player) {
+    const dx = (p2.x - p1.x) / ROPE_N;
+    const dy = (p2.y - p1.y) / ROPE_N;
+    rope.length = 0;
+    for (let i = 0; i <= ROPE_N; i++) {
+      const x = p1.x + dx * i;
+      const y = p1.y + dy * i;
+      rope.push({ x, y, px: x, py: y });
+    }
+    segLen = (ropeLenRef.current ?? ROPE_MAX_LEN) / ROPE_N;
+  }
+
+  function ropeIntegrate(dt: number) {
+    const g = GRAV; // add gravity to rope so it sags
+    for (const n of rope) {
+      const vx = n.x - n.px,
+        vy = n.y - n.py;
+      n.px = n.x;
+      n.py = n.y;
+      n.x += vx;
+      n.y += vy + g; // Verlet + gravity
+    }
+  }
+
+  function ropeSatisfyConstraints(p1: Player, p2: Player) {
+    // pin ends to players
+    rope[0].x = p1.x;
+    rope[0].y = p1.y;
+    rope[ROPE_N].x = p2.x;
+    rope[ROPE_N].y = p2.y;
+
+    // distance constraints along the chain
+    for (let k = 0; k < ROPE_ITERS; k++) {
+      for (let i = 0; i < ROPE_N; i++) {
+        const a = rope[i],
+          b = rope[i + 1];
+        let dx = b.x - a.x,
+          dy = b.y - a.y;
+        const d = Math.hypot(dx, dy) || 1e-6;
+        const diff = (d - segLen) / d;
+
+        // classic PBD split (equal mass), optionally soften via compliance
+        const corr = 0.5 * diff; // 0.5 each end
+        dx *= corr;
+        dy *= corr;
+        if (i !== 0) {
+          a.x += dx;
+          a.y += dy;
+        } // don’t move pinned end
+        if (i + 1 !== ROPE_N) {
+          b.x -= dx;
+          b.y -= dy;
+        }
+
+        // (Optional) simple damping: pull nodes a bit toward last frame
+        // or use your existing dampAlongRope between players.
+      }
+
+      // pin again after internal passes
+      rope[0].x = p1.x;
+      rope[0].y = p1.y;
+      rope[ROPE_N].x = p2.x;
+      rope[ROPE_N].y = p2.y;
+    }
+  }
 
   return (
     <main className="pt-4">
